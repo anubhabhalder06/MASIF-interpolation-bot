@@ -11,6 +11,16 @@
 
 ---
 
+## Demo
+
+<p align="center">
+  <img src="demo.gif" alt="MASIF AI Slow Motion Demo" width="600px" />
+</p>
+
+> **AI-powered smooth interpolation:** MASIF generates genuine new frames to transform standard video into cinematic slow-motion.
+
+---
+
 ## What is MASIF?
 
 MASIF is a full-stack AI video processing framework that takes any standard-FPS video and transforms it into smooth, cinematic slow-motion by intelligently generating the missing frames using **Google's FILM (Frame Interpolation for Large Motion)** model.
@@ -31,31 +41,15 @@ The entire pipeline runs on **free Kaggle/Colab GPU**, and users interact with i
 
 ---
 
-## What Makes MASIF Different — 3 Original Contributions
+## What Makes MASIF Unique
 
-### I-01 · Adaptive Motion-Aware Interpolation Scheduling
+Most tools that use Google's FILM model just wrap it and run it uniformly on every frame — no intelligence, no scheduling, no delivery system. MASIF is different in three ways:
 
-> *"Static scenes use fewer passes. Fast scenes get more. First of its kind."*
+**I-01 · Adaptive Motion-Aware Scheduling** — Before interpolating, MASIF analyses every frame pair using optical flow and classifies motion as low, medium, or high. It then applies 1×, 2×, or 3× FILM passes per segment accordingly. Static scenes don't waste compute. Fast scenes get the passes they actually need. No existing open-source FILM wrapper does this.
 
-MASIF segments every video by **motion intensity** using optical flow analysis before interpolation begins. Each segment is classified as low, medium, or high motion. The number of FILM interpolation passes is then allocated **proportionally per segment**:
+**I-02 · Visual Speed-Curve Editor** *(in progress)* — A Gradio interface where you draw a curve to control which part of the video slows down and by how much — like After Effects' time-remapping, but completely free and open-source. First implementation of its kind on top of FILM.
 
-- Low motion → 1× FILM pass
-- Medium motion → 2× FILM passes
-- High motion → 3× FILM passes
-
-No existing open-source FILM wrapper does per-segment resource allocation. Uniform processing wastes compute on static frames while under-serving fast-action frames. MASIF fixes both simultaneously.
-
-### I-02 · Visual Speed-Curve Graph Editor *(Planned — Gradio/Streamlit)*
-
-> *"Like After Effects' time-remapping — but free and open-source."*
-
-A timeline-based interface where the user draws a **speed curve** to define which part of the video slows down and by how much. Slow just the peak of a jump. Speed up the run-up. This is the first open-source FILM-based tool that allows user-controlled selective slow-motion via a visual curve.
-
-### I-03 · Telegram Bot for Zero-Setup Delivery
-
-> *"First ML-heavy video pipeline deployed via a conversational interface."*
-
-The entire pipeline — GPU processing, frame extraction, FILM inference, video encoding — happens on the cloud. The user only needs Telegram. Send a video, receive slow-mo back. No accounts. No installs. No GPU. This democratises professional frame interpolation.
+**I-03 · Telegram Delivery** — The entire GPU pipeline runs on the cloud. Users just send a video in Telegram and receive slow-mo back. No install, no account, no local GPU needed. First ML-heavy video pipeline deployed this way.
 
 ---
 
@@ -96,6 +90,7 @@ The entire pipeline — GPU processing, frame extraction, FILM inference, video 
 ```
 masif/
 │
+├── reference.mp4           # Demo video
 ├── bot/
 │   ├── bot.py              # Telegram bot — queue system, user sessions, Colab bridge
 │   └── .env.example        # Template for your environment variables
