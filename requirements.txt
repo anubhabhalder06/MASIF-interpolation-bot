@@ -1,3 +1,5 @@
-python-telegram-bot==20.7
-aiohttp==3.9.3
-python-dotenv==1.0.1
+python-telegram-bot
+requests
+flask
+gunicorn
+python-dotenv
