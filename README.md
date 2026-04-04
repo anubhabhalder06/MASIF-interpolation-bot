@@ -14,7 +14,7 @@
 ## Demo
 
 <p align="center">
-  <img src="demo.gif" alt="MASIF AI Slow Motion Demo" width="600px" />
+  <img src="demo.gif" alt="MASIF AI Slow Motion Demo" width="100%" />
 </p>
 
 > **AI-powered smooth interpolation:** MASIF generates genuine new frames to transform standard video into cinematic slow-motion.
