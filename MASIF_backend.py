@@ -1,16 +1,30 @@
-# ============================================================
-# MASIF — Kaggle Backend  (FULL PIPELINE)
-# Pipeline:
-#   FFmpeg extract frames → OpenCV optical flow classify
-#   → FILM interpolate → Frame interleave → FFmpeg stitch
-# ============================================================
+# ╔══════════════════════════════════════════════════════════════╗
+# ║              MASIF_backend.py — Kaggle Notebook              ║
+# ║   Paste each section into its own cell in order (1 → 5).    ║
+# ║   Run them top to bottom. Do NOT skip cells.                 ║
+# ╚══════════════════════════════════════════════════════════════╝
 
 
-# ── CELL 1: Install dependencies ─────────────────────────────
-# !pip install pyngrok tensorflow-hub opencv-python-headless ffmpeg-python Pillow flask -q
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ┌─────────────────────────────────────────────────────────────┐
+# │  CELL 1 — Install dependencies                              │
+# │  Paste this block into the first cell and run it.           │
+# │  Wait for the cell to finish before moving to Cell 2.       │
+# └─────────────────────────────────────────────────────────────┘
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+!pip install pyngrok tensorflow-hub opencv-python-headless ffmpeg-python Pillow flask -q
 
 
-# ── CELL 2: Download FILM model ──────────────────────────────
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ┌─────────────────────────────────────────────────────────────┐
+# │  CELL 2 — Download FILM model weights                       │
+# │  This downloads ~1 GB from Google Drive.                    │
+# │  It auto-skips if the model folder already exists.          │
+# │  Wait for "Model ready." before moving to Cell 3.           │
+# └─────────────────────────────────────────────────────────────┘
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 import os
 
 MODEL_PATH = "/kaggle/working/film_net/pretrained_models/film_net/Style/saved_model"
@@ -28,7 +42,14 @@ else:
     print("Model already present. Skipping download.")
 
 
-# ── CELL 3: Imports ──────────────────────────────────────────
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ┌─────────────────────────────────────────────────────────────┐
+# │  CELL 3 — Imports                                           │
+# │  Paste and run. Ignore the CUDA/cuDNN warnings —            │
+# │  they are harmless and expected on Kaggle.                  │
+# └─────────────────────────────────────────────────────────────┘
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 import io
 import cv2
 import glob
@@ -44,18 +65,40 @@ from flask import Flask, request, send_file
 from pyngrok import ngrok
 
 
-# ── CELL 4: ngrok auth ───────────────────────────────────────
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ┌─────────────────────────────────────────────────────────────┐
+# │  CELL 4 — ngrok auth token                                  │
+# │  Go to Kaggle → Add-ons → Secrets → Add secret:            │
+# │    Name : NGROK_AUTH_TOKEN                                  │
+# │    Value: your token from ngrok.com/dashboard               │
+# │  Then paste and run this cell.                              │
+# └─────────────────────────────────────────────────────────────┘
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 try:
     from kaggle_secrets import UserSecretsClient
     NGROK_TOKEN = UserSecretsClient().get_secret("NGROK_AUTH_TOKEN")
 except Exception:
-    NGROK_TOKEN = "YOUR_TOKEN_HERE"
+    NGROK_TOKEN = "YOUR_TOKEN_HERE"  # fallback — replace if Secrets aren't set up
 
 logging.getLogger('werkzeug').disabled = True
 ngrok.set_auth_token(NGROK_TOKEN)
 
 
-# ── CELL 5: Load FILM model ───────────────────────────────────
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ┌─────────────────────────────────────────────────────────────┐
+# │  CELL 5 — Full pipeline + Flask server (MAIN CELL)         │
+# │  This is the last cell. Running it:                         │
+# │    1. Loads the FILM model into GPU memory (~30 s)          │
+# │    2. Starts the Flask server                               │
+# │    3. Opens an ngrok tunnel                                 │
+# │    4. Prints your public /process URL                       │
+# │  Copy that URL into your bot's COLAB_BACKEND_URL env var.  │
+# │  The cell runs forever — that is normal and expected.       │
+# └─────────────────────────────────────────────────────────────┘
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# ── Load FILM model ───────────────────────────────────────────
 print("Loading FILM model...")
 _film_model = tf.saved_model.load(MODEL_PATH)
 _film_infer = _film_model.signatures["serving_default"]
@@ -270,11 +313,7 @@ def interleave_frames(frame_paths: list[str],
 
 def stitch_frames(final_frames_dir: str, fps: float,
                   output_path: str, original_video_path: str) -> str:
-    """
-    Encode all final_*.png frames into MP4 at original FPS,
-    then mux back the original audio (skipped silently if no audio track).
-    """
-    temp_video    = output_path.replace(".mp4", "_noaudio.mp4")
+
     frame_pattern = os.path.join(final_frames_dir, "final_%07d.png")
 
     subprocess.run([
@@ -285,25 +324,8 @@ def stitch_frames(final_frames_dir: str, fps: float,
         "-preset",    "fast",
         "-crf",       "18",
         "-pix_fmt",   "yuv420p",
-        temp_video
-    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-
-    result = subprocess.run([
-        "ffmpeg", "-y",
-        "-i", temp_video,
-        "-i", original_video_path,
-        "-map", "0:v:0",
-        "-map", "1:a:0?",
-        "-c:v", "copy",
-        "-c:a", "aac",
-        "-shortest",
         output_path
-    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    if result.returncode != 0:
-        shutil.move(temp_video, output_path)
-    elif os.path.exists(temp_video):
-        os.remove(temp_video)
+    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
     print(f"[Step 5] Output written -> {output_path}")
     return output_path
@@ -323,7 +345,7 @@ def run_pipeline(input_path: str, speed: float = 0.5,
       2. OpenCV       -> classify each segment (slow / medium / fast)
       3. FILM         -> generate new frames per pair
       4. Interleaver  -> merge original + new frames in order
-      5. FFmpeg       -> stitch back into .mp4 with audio
+      5. FFmpeg       -> stitch back into .mp4
     """
     work_dir   = f"masif_work_{os.getpid()}"
     frames_dir = os.path.join(work_dir, "frames")
@@ -419,7 +441,7 @@ def process_video():
 
 
 # ══════════════════════════════════════════════════════════════
-# Startup
+# Startup — ngrok tunnel + Flask server
 # ══════════════════════════════════════════════════════════════
 
 def get_free_port(start=5000):
