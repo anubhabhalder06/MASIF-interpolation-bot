@@ -5,6 +5,8 @@ import time
 import logging
 from datetime import datetime
 from collections import deque
+from threading import Thread # Added for Render
+from flask import Flask      # Added for Render
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from telegram.error import TimedOut, NetworkError
@@ -12,6 +14,24 @@ from dotenv import load_dotenv
 
 load_dotenv()
 logging.basicConfig(level=logging.WARNING)
+
+# ──────────────────────────────────────────────
+# Render Health Check (Keeps the bot alive)
+# ──────────────────────────────────────────────
+flask_app = Flask(__name__)
+
+@flask_app.route('/')
+def health_check():
+    return "MASIF Bot is alive!", 200
+
+def run_flask():
+    # Disable flask logs to keep your Render console clean
+    log = logging.getLogger('werkzeug')
+    log.setLevel(logging.ERROR)
+    
+    port = int(os.environ.get("PORT", 8080))
+    flask_app.run(host='0.0.0.0', port=port)
+
 
 # ──────────────────────────────────────────────
 # Safe query.answer() — never crashes on timeout
@@ -30,7 +50,7 @@ async def safe_answer(query):
 # ──────────────────────────────────────────────
 
 SPINNER = ["🌑", "🌒", "🌓", "🌔", "🌕", "🌖", "🌗", "🌘"]
-PULSE_BAR = ["[=     ]", "[ =    ]", "[  =   ]", "[   =  ]", "[    = ]", "[     =]", "[    = ]", "[   =  ]", "[  =   ]", "[ =    ]"]
+PULSE_BAR = ["[=    ]", "[ =   ]", "[  =  ]", "[   = ]", "[    =]", "[    =]", "[   = ]", "[  =  ]", "[ =   ]", "[=    ]"]
 
 PIPELINE_STAGES = [
     (1, "📥", "Downloading your video"),
@@ -753,5 +773,9 @@ class SlowMoBot:
 
 
 if __name__ == "__main__":
+    # Start the Flask health check in the background first
+    Thread(target=run_flask, daemon=True).start()
+    
+    # Start the Telegram Bot
     bot = SlowMoBot()
     bot.run()
