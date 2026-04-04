@@ -1,449 +1,824 @@
-# ============================================================
-# MASIF — Kaggle Backend  (FULL PIPELINE)
-# Pipeline:
-#   FFmpeg extract frames → OpenCV optical flow classify
-#   → FILM interpolate → Frame interleave → FFmpeg stitch
-# ============================================================
-
-
-# ── CELL 1: Install dependencies ─────────────────────────────
-# !pip install pyngrok tensorflow-hub opencv-python-headless ffmpeg-python Pillow flask -q
-
-
-# ── CELL 2: Download FILM model ──────────────────────────────
 import os
-
-MODEL_PATH = "/kaggle/working/film_net/pretrained_models/film_net/Style/saved_model"
-
-if not os.path.exists(MODEL_PATH):
-    print("Downloading FILM model weights...")
-    os.system("pip install -q gdown")
-    os.system('gdown "https://drive.google.com/uc?id=1rEABCoyQFkmHGieKDhHXW2ZYJi12lofI" -O pretrained_models.zip')
-
-    print("Extracting model archive...")
-    os.system("unzip -q pretrained_models.zip -d /kaggle/working/film_net/")
-    os.system("rm pretrained_models.zip")
-    print("Model ready.")
-else:
-    print("Model already present. Skipping download.")
-
-
-# ── CELL 3: Imports ──────────────────────────────────────────
-import io
-import cv2
-import glob
-import shutil
-import subprocess
+import asyncio
+import aiohttp
+import time
 import logging
-import socket
-import requests
-import numpy as np
-import tensorflow as tf
-from pathlib import Path
-from flask import Flask, request, send_file
-from pyngrok import ngrok
+from datetime import datetime
+from collections import deque
+from threading import Thread # Added for Render
+from flask import Flask      # Added for Render
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+from telegram.error import TimedOut, NetworkError
+from dotenv import load_dotenv
+
+load_dotenv()
+logging.basicConfig(level=logging.WARNING)
+
+# ──────────────────────────────────────────────
+# Render Health Check (Keeps the bot alive)
+# ──────────────────────────────────────────────
+flask_app = Flask(__name__)
+
+@flask_app.route('/')
+def health_check():
+    return "MASIF Bot is alive!", 200
+
+def run_flask():
+    # Disable flask logs to keep your Render console clean
+    log = logging.getLogger('werkzeug')
+    log.setLevel(logging.ERROR)
+    
+    port = int(os.environ.get("PORT", 8080))
+    flask_app.run(host='0.0.0.0', port=port)
 
 
-# ── CELL 4: ngrok auth ───────────────────────────────────────
-try:
-    from kaggle_secrets import UserSecretsClient
-    NGROK_TOKEN = UserSecretsClient().get_secret("NGROK_AUTH_TOKEN")
-except Exception:
-    NGROK_TOKEN = "YOUR_TOKEN_HERE"
-
-logging.getLogger('werkzeug').disabled = True
-ngrok.set_auth_token(NGROK_TOKEN)
-
-
-# ── CELL 5: Load FILM model ───────────────────────────────────
-print("Loading FILM model...")
-_film_model = tf.saved_model.load(MODEL_PATH)
-_film_infer = _film_model.signatures["serving_default"]
-print("FILM model loaded successfully.")
-
-
-# ══════════════════════════════════════════════════════════════
-# STEP 1 — FFmpeg: Extract frames as PNG files
-# ══════════════════════════════════════════════════════════════
-
-def extract_frames(video_path: str, frames_dir: str) -> tuple[list[str], float]:
-    """
-    Use FFmpeg to extract every frame from the video as a PNG file.
-    Returns (sorted list of PNG paths, original FPS).
-    """
-    os.makedirs(frames_dir, exist_ok=True)
-
-    probe = subprocess.run([
-        "ffprobe", "-v", "error",
-        "-select_streams", "v:0",
-        "-show_entries", "stream=r_frame_rate",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        video_path
-    ], capture_output=True, text=True)
-
+# ──────────────────────────────────────────────
+# Safe query.answer() — never crashes on timeout
+# ──────────────────────────────────────────────
+async def safe_answer(query):
     try:
-        num, den = probe.stdout.strip().split("/")
-        fps = float(num) / float(den)
+        await query.answer()
+    except (TimedOut, NetworkError):
+        pass
     except Exception:
-        fps = 30.0
-
-    subprocess.run([
-        "ffmpeg", "-y", "-i", video_path,
-        os.path.join(frames_dir, "frame_%06d.png")
-    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-
-    frame_paths = sorted(glob.glob(os.path.join(frames_dir, "frame_*.png")))
-    print(f"[Step 1] Extracted {len(frame_paths)} frames at {fps:.2f} FPS -> {frames_dir}/")
-    return frame_paths, fps
+        pass
 
 
-# ══════════════════════════════════════════════════════════════
-# STEP 2 — OpenCV Optical Flow: Classify each segment
-# ══════════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────
+# Animated progress system (Upgraded UI)
+# ──────────────────────────────────────────────
 
-SLOW_THRESHOLD   = 2.0
-MEDIUM_THRESHOLD = 8.0
+SPINNER = ["🌑", "🌒", "🌓", "🌔", "🌕", "🌖", "🌗", "🌘"]
 
-def classify_motion(frame_path_a: str, frame_path_b: str) -> str:
-    """
-    Compute dense optical flow between two frames.
-    Returns 'slow', 'medium', or 'fast'.
-    """
-    img_a = cv2.imread(frame_path_a, cv2.IMREAD_GRAYSCALE)
-    img_b = cv2.imread(frame_path_b, cv2.IMREAD_GRAYSCALE)
+# Waveform that scrolls left — renders nicely in monospace
+WAVE_FRAMES = [
+    "▁▂▄▆█▆▄▂▁▂▄▆█",
+    "▂▄▆█▆▄▂▁▂▄▆█▆",
+    "▄▆█▆▄▂▁▂▄▆█▆▄",
+    "▆█▆▄▂▁▂▄▆█▆▄▂",
+    "█▆▄▂▁▂▄▆█▆▄▂▁",
+    "▆▄▂▁▂▄▆█▆▄▂▁▂",
+    "▄▂▁▂▄▆█▆▄▂▁▂▄",
+    "▂▁▂▄▆█▆▄▂▁▂▄▆",
+]
 
-    if img_a is None or img_b is None:
-        return "medium"
+# GPU load bar that fluctuates realistically
+GPU_BARS = [
+    "████████░░  82%",
+    "█████████░  91%",
+    "██████████  99%",
+    "█████████░  94%",
+    "████████░░  87%",
+    "██████░░░░  63%",
+    "███████░░░  74%",
+    "█████████░  96%",
+    "████████░░  80%",
+    "██████████  100%",
+]
 
-    flow      = cv2.calcOpticalFlowFarneback(
-                    img_a, img_b, None,
-                    pyr_scale=0.5, levels=3, winsize=15,
-                    iterations=3, poly_n=5, poly_sigma=1.2, flags=0)
-    magnitude = np.sqrt(flow[..., 0] ** 2 + flow[..., 1] ** 2)
-    mean_mag  = float(np.mean(magnitude))
+# Kept for non-AI stages (simple left-right sweep)
+PULSE_BAR = ["[=    ]", "[ =   ]", "[  =  ]", "[   = ]", "[    =]", "[    =]", "[   = ]", "[  =  ]", "[ =   ]", "[=    ]"]
 
-    if mean_mag < SLOW_THRESHOLD:
-        return "slow"
-    elif mean_mag < MEDIUM_THRESHOLD:
-        return "medium"
+PIPELINE_STAGES = [
+    (1, "📥", "Downloading your video"),
+    (2, "🚀", "Sending to AI backend"),
+    (3, "🧠", "AI is generating frames"),
+    (4, "🎬", "Encoding slow-motion video"),
+    (5, "📤", "Uploading result to you"),
+]
+
+WHILE_YOU_WAIT = [
+    "Creating frames that literally didn't exist before...",
+    "GPU cores are heating up...",
+    "Analysing motion vectors between every frame pair...",
+    "Smoothing pixel transitions with FILM AI...",
+    "Predicting where pixels *would* have been...",
+    "Interpolating with surgical precision...",
+    "The AI has seen your video and is deeply inspired...",
+    "Running optical flow calculations...",
+    "Painting in-between frames from scratch...",
+    "Kaggle/Colab GPU is sweating right now...",
+    "Almost there, formatting the temporal dimensions...",
+    "Every new frame is a tiny work of art...",
+]
+
+def build_bar(filled: int, total: int = 5) -> str:
+    return "█" * filled + "░" * (total - filled)
+
+def format_elapsed(seconds: float) -> str:
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    m, sec = divmod(s, 60)
+    return f"{m}m {sec}s"
+
+def _make_text(spin_char: str, stage_num: int, emoji: str,
+               label: str, elapsed: str, sub: str = "", pulse_idx: int = 0) -> str:
+
+    if stage_num == 3:
+        # ── Dynamic AI stage ──────────────────────────────────────────────
+        wave      = WAVE_FRAMES[pulse_idx % len(WAVE_FRAMES)]
+        gpu_bar   = GPU_BARS[pulse_idx % len(GPU_BARS)]
+        # Fake frame counter — ramps up naturally, caps at 999
+        frames    = min(pulse_idx * 17 + (pulse_idx % 6) * 4, 999)
+
+        text = (
+            f"{spin_char}  *MASIF — AI Processing*\n\n"
+            f"`{wave}`\n\n"
+            f"🖥️  GPU    `{gpu_bar}`\n"
+            f"🎞️  Frames  `{frames:04d}` interpolated\n\n"
+            f"{emoji}  *{label}*"
+        )
+        if sub:
+            text += f"\n_{sub}_"
+        text += f"\n\n⏱  *Time elapsed:* `{elapsed}`"
+
     else:
-        return "fast"
+        # ── Standard stage ────────────────────────────────────────────────
+        bar     = build_bar(stage_num)
+        pct     = int(stage_num / len(PIPELINE_STAGES) * 100)
+        text = (
+            f"{spin_char}  *MASIF is processing your video*\n\n"
+            f"`{bar}` {pct}%\n\n"
+            f"{emoji}  *Current Stage: {label}*"
+        )
+        if sub:
+            text += f"\n_{sub}_"
+        text += f"\n\n⏱  *Time elapsed:* {elapsed}"
 
-def classify_all_segments(frame_paths: list[str]) -> list[str]:
-    """
-    Classify motion for every consecutive frame pair.
-    Returns a list of labels, length = len(frame_paths) - 1.
-    """
-    labels = []
-    total  = len(frame_paths) - 1
-    for i in range(total):
-        label = classify_motion(frame_paths[i], frame_paths[i + 1])
-        labels.append(label)
-        if (i + 1) % 30 == 0 or (i + 1) == total:
-            slow   = labels.count("slow")
-            medium = labels.count("medium")
-            fast   = labels.count("fast")
-            print(f"   Classified {i+1}/{total} segments  |  slow: {slow}  medium: {medium}  fast: {fast}")
-    return labels
+    return text
 
+# Includes the Cancel button directly on the loading screen
+CANCEL_KEYBOARD = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Processing", callback_data="cancel_active")]])
 
-# ══════════════════════════════════════════════════════════════
-# STEP 3 — FILM: Generate new frames between each pair
-# ══════════════════════════════════════════════════════════════
+async def send_stage(bot, user_id: int, stage_idx: int,
+                     elapsed: str = "0s", sub: str = "") -> int:
+    _, emoji, label = PIPELINE_STAGES[stage_idx]
+    text = _make_text(SPINNER[0], stage_idx + 1, emoji, label, elapsed, sub)
+    msg  = await bot.send_message(user_id, text, reply_markup=CANCEL_KEYBOARD, parse_mode='Markdown')
+    return msg.message_id
 
-MOTION_PASSES = {
-    "slow":   0,
-    "medium": 0,
-    "fast":   1,
-}
-
-def _film_midpoint(img_a: np.ndarray, img_b: np.ndarray) -> np.ndarray:
-    """Run FILM once to get the midpoint frame. Inputs: float32 [H,W,3] in [0,1]."""
-    x0 = tf.cast(tf.expand_dims(img_a, 0), tf.float32)
-    x1 = tf.cast(tf.expand_dims(img_b, 0), tf.float32)
-    dt = tf.constant([[0.5]], dtype=tf.float32)
-
-    result = _film_infer(x0=x0, x1=x1, time=dt)
-
-    if "interpolated_image" in result:
-        out_key = "interpolated_image"
-    elif "image" in result:
-        out_key = "image"
-    else:
-        out_key = [k for k in result.keys() if result[k].shape[-1] == 3][0]
-
-    return tf.squeeze(result[out_key], axis=0).numpy()
-
-def _load_frame(path: str) -> np.ndarray:
-    """Load PNG as float32 RGB in [0, 1]."""
-    bgr = cv2.imread(path).astype(np.float32) / 255.0
-    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-
-def _save_frame(img: np.ndarray, path: str):
-    """Save float32 RGB [0,1] as PNG."""
-    bgr = cv2.cvtColor((np.clip(img, 0, 1) * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
-    cv2.imwrite(path, bgr)
-
-def generate_between_pair(img_a: np.ndarray, img_b: np.ndarray,
-                           passes: int) -> list[np.ndarray]:
-    """
-    Recursively generate intermediate frames using FILM.
-    passes=1 -> [mid]           (1 new frame)
-    passes=2 -> [q1, mid, q3]  (3 new frames)
-    passes=3 -> 7 new frames
-    Returns frames in chronological order, NOT including a or b.
-    """
-    if passes == 0:
-        return []
-    mid   = _film_midpoint(img_a, img_b)
-    left  = generate_between_pair(img_a, mid, passes - 1)
-    right = generate_between_pair(mid, img_b, passes - 1)
-    return left + [mid] + right
-
-def interpolate_all_segments(frame_paths: list[str],
-                              motion_labels: list[str],
-                              interp_dir: str,
-                              global_passes: int) -> dict[int, list[str]]:
-    """
-    For each consecutive pair, generate new frames and save to interp_dir.
-    Returns dict: {pair_index -> [ordered list of new frame file paths]}
-    """
-    os.makedirs(interp_dir, exist_ok=True)
-    new_frames_map = {}
-    total = len(frame_paths) - 1
-
-    for i in range(total):
-        label  = motion_labels[i]
-        passes = global_passes + MOTION_PASSES.get(label, 0)
-
-        img_a   = _load_frame(frame_paths[i])
-        img_b   = _load_frame(frame_paths[i + 1])
-        between = generate_between_pair(img_a, img_b, passes)
-
-        saved = []
-        for j, frame in enumerate(between):
-            out_path = os.path.join(interp_dir, f"new_{i:06d}_{j:04d}.png")
-            _save_frame(frame, out_path)
-            saved.append(out_path)
-
-        new_frames_map[i] = saved
-
-        if (i + 1) % 20 == 0 or (i + 1) == total:
-            print(f"   Pair {i+1}/{total}  [{label}, {passes} pass(es) -> {len(between)} new frames]")
-
-    return new_frames_map
-
-
-# ══════════════════════════════════════════════════════════════
-# STEP 4 — Frame Interleaver: Sort original + new frames
-# ══════════════════════════════════════════════════════════════
-
-def interleave_frames(frame_paths: list[str],
-                      new_frames_map: dict[int, list[str]],
-                      output_dir: str) -> list[str]:
-    """
-    Weave original and generated frames into final chronological order.
-    Copies everything into output_dir with sequential names for FFmpeg.
-    """
-    os.makedirs(output_dir, exist_ok=True)
-    counter = 0
-
-    for i, orig_path in enumerate(frame_paths):
-        dst = os.path.join(output_dir, f"final_{counter:07d}.png")
-        shutil.copy2(orig_path, dst)
-        counter += 1
-
-        if i in new_frames_map:
-            for new_path in new_frames_map[i]:
-                dst = os.path.join(output_dir, f"final_{counter:07d}.png")
-                shutil.copy2(new_path, dst)
-                counter += 1
-
-    final_paths = sorted(glob.glob(os.path.join(output_dir, "final_*.png")))
-    print(f"[Step 4] Interleaved -> {len(final_paths)} total frames")
-    return final_paths
-
-
-# ══════════════════════════════════════════════════════════════
-# STEP 5 — FFmpeg: Stitch frames back into .mp4
-# ══════════════════════════════════════════════════════════════
-
-def stitch_frames(final_frames_dir: str, fps: float,
-                  output_path: str, original_video_path: str) -> str:
-    """
-    Encode all final_*.png frames into MP4 at original FPS,
-    then mux back the original audio (skipped silently if no audio track).
-    """
-    temp_video    = output_path.replace(".mp4", "_noaudio.mp4")
-    frame_pattern = os.path.join(final_frames_dir, "final_%07d.png")
-
-    subprocess.run([
-        "ffmpeg", "-y",
-        "-framerate", str(fps),
-        "-i",         frame_pattern,
-        "-vcodec",    "libx264",
-        "-preset",    "fast",
-        "-crf",       "18",
-        "-pix_fmt",   "yuv420p",
-        temp_video
-    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-
-    result = subprocess.run([
-        "ffmpeg", "-y",
-        "-i", temp_video,
-        "-i", original_video_path,
-        "-map", "0:v:0",
-        "-map", "1:a:0?",
-        "-c:v", "copy",
-        "-c:a", "aac",
-        "-shortest",
-        output_path
-    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    if result.returncode != 0:
-        shutil.move(temp_video, output_path)
-    elif os.path.exists(temp_video):
-        os.remove(temp_video)
-
-    print(f"[Step 5] Output written -> {output_path}")
-    return output_path
-
-
-# ══════════════════════════════════════════════════════════════
-# MASTER PIPELINE
-# ══════════════════════════════════════════════════════════════
-
-SPEED_TO_PASSES = {0.5: 1, 0.25: 2, 0.125: 3}
-
-def run_pipeline(input_path: str, speed: float = 0.5,
-                 output_path: str = "masif_output.mp4") -> tuple[str, float]:
-    """
-    Full MASIF pipeline:
-      1. FFmpeg       -> extract frames as PNG
-      2. OpenCV       -> classify each segment (slow / medium / fast)
-      3. FILM         -> generate new frames per pair
-      4. Interleaver  -> merge original + new frames in order
-      5. FFmpeg       -> stitch back into .mp4 with audio
-    """
-    work_dir   = f"masif_work_{os.getpid()}"
-    frames_dir = os.path.join(work_dir, "frames")
-    interp_dir = os.path.join(work_dir, "interpolated")
-    final_dir  = os.path.join(work_dir, "final")
-
+async def edit_stage(bot, user_id: int, msg_id: int, stage_idx: int,
+                     spin_idx: int = 0, elapsed: str = "0s", sub: str = "", pulse_idx: int = 0):
+    _, emoji, label = PIPELINE_STAGES[stage_idx]
+    spin = SPINNER[spin_idx % len(SPINNER)]
+    text = _make_text(spin, stage_idx + 1, emoji, label, elapsed, sub, pulse_idx)
     try:
-        print(f"\n{'='*55}")
-        print(f"MASIF  |  speed={speed}x  |  {os.path.basename(input_path)}")
-        print(f"{'='*55}")
+        await bot.edit_message_text(
+            chat_id=user_id, message_id=msg_id,
+            text=text, reply_markup=CANCEL_KEYBOARD, parse_mode='Markdown'
+        )
+    except Exception:
+        pass # Ignore "Message is not modified" errors from Telegram
 
-        global_passes = SPEED_TO_PASSES.get(round(speed, 4), 1)
+async def run_live_ticker(bot, user_id: int, msg_id: int, start_time: float):
+    """
+    Edits the progress message every 2.5 seconds while the backend runs.
+    """
+    spin_idx = 0
+    pulse_idx = 0
+    msg_idx  = 0
+    try:
+        while True:
+            await asyncio.sleep(2.5)
+            elapsed = format_elapsed(time.time() - start_time)
+            sub     = WHILE_YOU_WAIT[msg_idx % len(WHILE_YOU_WAIT)]
+            
+            await edit_stage(bot, user_id, msg_id,
+                             stage_idx=2, # Stage 3 (AI processing)
+                             spin_idx=spin_idx,
+                             elapsed=elapsed,
+                             sub=sub,
+                             pulse_idx=pulse_idx)
+            spin_idx += 1
+            pulse_idx += 1
+            
+            # Rotate fun message every 6 ticks (~15s)
+            if spin_idx % 6 == 0:  
+                msg_idx += 1
+    except asyncio.CancelledError:
+        pass
 
-        print("\n[Step 1] Extracting frames with FFmpeg...")
-        frame_paths, fps = extract_frames(input_path, frames_dir)
-        if len(frame_paths) < 2:
-            raise RuntimeError("Video too short — need at least 2 frames.")
 
-        print("\n[Step 2] Classifying motion with OpenCV optical flow...")
-        motion_labels = classify_all_segments(frame_paths)
-        print(f"   slow: {motion_labels.count('slow')}  "
-              f"medium: {motion_labels.count('medium')}  "
-              f"fast: {motion_labels.count('fast')}")
+# ──────────────────────────────────────────────
+# Queue
+# ──────────────────────────────────────────────
 
-        print(f"\n[Step 3] FILM interpolation  (base {global_passes} pass(es) + motion bonus)...")
-        new_frames_map = interpolate_all_segments(
-            frame_paths, motion_labels, interp_dir, global_passes
+class VideoProcessingQueue:
+    def __init__(self):
+        self.waiting_queue             = deque()
+        self.is_processing             = False
+        self.current_user              = None
+        self.processing_start_time     = None
+        self.estimated_time_per_video  = 180
+        self.max_queue_size            = 50
+        self.cancelled_during_processing = set()
+
+    def add_to_queue(self, user_id, video_info, processing_params, bot):
+        if len(self.waiting_queue) >= self.max_queue_size:
+            return False, "Queue is full. Try again later."
+        position = len(self.waiting_queue) + 1
+        self.waiting_queue.append({
+            "user_id":           user_id,
+            "video_info":        video_info,
+            "processing_params": processing_params,
+            "joined_at":         datetime.now(),
+            "bot":               bot,
+            "input_file":        None,
+            "output_file":       None,
+        })
+        return True, position
+
+    def get_queue_position(self, user_id):
+        for i, item in enumerate(self.waiting_queue):
+            if item["user_id"] == user_id:
+                return i + 1
+        return None
+
+    def is_user_processing(self, user_id):
+        return self.is_processing and self.current_user and self.current_user["user_id"] == user_id
+
+    def get_wait_time(self, position):
+        if self.is_processing:
+            elapsed   = (datetime.now() - self.processing_start_time).seconds
+            remaining = max(0, self.estimated_time_per_video - elapsed)
+            return remaining + (position - 1) * self.estimated_time_per_video
+        return (position - 1) * self.estimated_time_per_video
+
+    def cancel_queued(self, user_id):
+        for i, item in enumerate(self.waiting_queue):
+            if item["user_id"] == user_id:
+                self._cleanup_files(item)
+                del self.waiting_queue[i]
+                return True
+        return False
+
+    def cancel_processing(self, user_id):
+        if self.is_user_processing(user_id):
+            self.cancelled_during_processing.add(user_id)
+            return True
+        return False
+
+    def is_cancelled(self, user_id):
+        return user_id in self.cancelled_during_processing
+
+    def clear_cancelled(self, user_id):
+        self.cancelled_during_processing.discard(user_id)
+
+    def _cleanup_files(self, queue_item):
+        for key in ("input_file", "output_file"):
+            path = queue_item.get(key)
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                    print(f"🗑️ Deleted: {path}")
+                except Exception as e:
+                    print(f"⚠️ Could not delete {path}: {e}")
+
+    def get_queue_info(self):
+        if not self.waiting_queue and not self.is_processing:
+            return "🟢 Queue is empty — instant processing available!"
+        info = []
+        if self.is_processing:
+            elapsed   = (datetime.now() - self.processing_start_time).seconds
+            remaining = max(0, self.estimated_time_per_video - elapsed)
+            info.append(f"🟡 Processing 1 video — ~{remaining // 60}m {remaining % 60}s left")
+        if self.waiting_queue:
+            info.append(f"📋 {len(self.waiting_queue)} video(s) waiting")
+        return "\n".join(info)
+
+    async def process_next(self, bot_instance):
+        if not self.is_processing and self.waiting_queue:
+            self.is_processing         = True
+            self.current_user          = self.waiting_queue[0]
+            self.processing_start_time = datetime.now()
+            bot = self.current_user["bot"]
+
+            asyncio.create_task(self._process(bot_instance))
+
+    async def _process(self, bot_instance):
+        bot     = self.current_user["bot"]
+        user_id = self.current_user["user_id"]
+        try:
+            success = await bot_instance.send_to_colab(self.current_user)
+
+            if self.is_cancelled(user_id):
+                self.clear_cancelled(user_id)
+                await bot.send_message(user_id,
+                    "🗑️ *Cancelled.* Your video and all files have been deleted.",
+                    parse_mode='Markdown'
+                )
+            elif not success:
+                await bot.send_message(user_id,
+                    "❌ *Processing failed.* Colab/Kaggle may be offline.\n\nUse /start to try again.",
+                    parse_mode='Markdown'
+                )
+        except Exception as e:
+            print(f"Queue process error: {e}")
+            await bot.send_message(user_id,
+                f"❌ *Error:* {str(e)[:100]}\n\nUse /start to try again.",
+                parse_mode='Markdown'
+            )
+        finally:
+            self._cleanup_files(self.current_user)
+            self.waiting_queue.popleft()
+            self.is_processing = False
+            self.current_user  = None
+            await self.process_next(bot_instance)
+
+
+# ──────────────────────────────────────────────
+# Bot
+# ──────────────────────────────────────────────
+
+class SlowMoBot:
+    def __init__(self):
+        self.token     = os.getenv("TELEGRAM_BOT_TOKEN")
+        self.colab_url = os.getenv("COLAB_BACKEND_URL")
+
+        if not self.token:
+            raise ValueError("TELEGRAM_BOT_TOKEN missing from .env")
+        if not self.colab_url:
+            raise ValueError("COLAB_BACKEND_URL missing from .env")
+
+        self.queue    = VideoProcessingQueue()
+        self.sessions = {}
+
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        name    = update.effective_user.first_name
+
+        text = (
+            f"👋 Hi {name}!\n\n"
+            f"*MASIF* — AI slow-motion & video smoother\n\n"
+            f"• Convert any FPS video to buttery slow-mo\n"
+            f"• Fix jittery or choppy footage\n"
+            f"• Free, no watermarks\n\n"
+            f"{self.queue.get_queue_info()}"
+        )
+        keyboard = [
+            [InlineKeyboardButton("🎬 Slow-Mo",      callback_data="create_slowmo"),
+             InlineKeyboardButton("🔄 Fix Jitter",  callback_data="fix_jitter")],
+            [InlineKeyboardButton("📊 Queue",        callback_data="queue_status"),
+             InlineKeyboardButton("❌ Cancel",       callback_data="cancel_request")],
+            [InlineKeyboardButton("❓ How it works", callback_data="how_it_works")]
+        ]
+        if update.message:
+            await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        else:
+            await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+    async def how_it_works(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await safe_answer(query)
+        text = (
+            "*How MASIF works*\n\n"
+            "1️⃣ Send your video\n"
+            "2️⃣ Choose speed / fix level\n"
+            "3️⃣ AI fills in missing frames using Google FILM\n"
+            "4️⃣ Receive your smooth slow-mo video\n\n"
+            "⚠️ Requires Colab/Kaggle backend to be running."
+        )
+        await query.edit_message_text(text,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Back", callback_data="back_to_menu")]]),
+            parse_mode='Markdown'
         )
 
-        print("\n[Step 4] Interleaving frames...")
-        interleave_frames(frame_paths, new_frames_map, final_dir)
+    async def create_slowmo_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query   = update.callback_query
+        await safe_answer(query)
+        user_id = update.effective_user.id
 
-        print("\n[Step 5] Encoding output with FFmpeg...")
-        stitch_frames(final_dir, fps, output_path, input_path)
+        if self.queue.get_queue_position(user_id) or self.queue.is_user_processing(user_id):
+            await query.edit_message_text(
+                "⚠️ You already have a video in progress.\nUse /cancel to remove it first.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Back", callback_data="back_to_menu")]]),
+                parse_mode='Markdown'
+            )
+            return
 
-        print(f"\nPipeline complete -> {output_path}\n")
-        return output_path, fps
+        self.sessions[user_id] = {"mode": "slowmo"}
+        await query.edit_message_text(
+            "*🎬 Send your video*\n\n"
+            "• MP4 / MOV / AVI\n"
+            "• Max 20MB, max 60s\n"
+            "• Any FPS works",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Back", callback_data="back_to_menu")]]),
+            parse_mode='Markdown'
+        )
 
-    finally:
-        if os.path.exists(work_dir):
-            shutil.rmtree(work_dir, ignore_errors=True)
+    async def fix_jitter_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query   = update.callback_query
+        await safe_answer(query)
+        user_id = update.effective_user.id
 
+        if self.queue.get_queue_position(user_id) or self.queue.is_user_processing(user_id):
+            await query.edit_message_text(
+                "⚠️ You already have a video in progress.\nUse /cancel to remove it first.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Back", callback_data="back_to_menu")]]),
+                parse_mode='Markdown'
+            )
+            return
 
-# ══════════════════════════════════════════════════════════════
-# Flask API
-# ══════════════════════════════════════════════════════════════
+        self.sessions[user_id] = {"mode": "jitter_fix"}
+        await query.edit_message_text(
+            "*🔄 Send your jittery video*\n\n"
+            "• MP4 / MOV / AVI\n"
+            "• Max 20MB, max 60s",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Back", callback_data="back_to_menu")]]),
+            parse_mode='Markdown'
+        )
 
-app = Flask(__name__)
+    async def handle_video(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
 
-@app.route('/')
-def home():
-    return "MASIF backend is running."
+        if user_id not in self.sessions:
+            await update.message.reply_text("Use /start first to set up your request.")
+            return
 
-@app.route('/process', methods=['POST'])
-def process_video():
-    input_path  = f"input_{os.getpid()}.mp4"
-    output_path = f"masif_output_{os.getpid()}.mp4"
+        if self.queue.get_queue_position(user_id) or self.queue.is_user_processing(user_id):
+            await update.message.reply_text("⚠️ You already have a video in progress. Use /cancel to remove it.")
+            return
 
-    try:
-        data         = request.get_json(force=True, silent=True) or {}
-        video_url    = data.get('video_url')
-        speed_option = float(data.get('speed', 0.5))
+        video = update.message.video
+        if not video:
+            await update.message.reply_text("Please send a valid video file.")
+            return
 
-        if not video_url:
-            return {"error": "No video_url provided"}, 400
+        if video.file_size > 20 * 1024 * 1024:
+            await update.message.reply_text("❌ File too large. Max 20MB.")
+            return
 
-        print(f"\nDownloading input video...")
-        r = requests.get(video_url, timeout=60)
-        r.raise_for_status()
-        with open(input_path, 'wb') as f:
-            f.write(r.content)
-        print(f"   {os.path.getsize(input_path)/1024/1024:.1f} MB received")
+        video_info = {
+            "file_id":  video.file_id,
+            "duration": video.duration,
+            "size_mb":  round(video.file_size / (1024 * 1024), 2),
+        }
+        self.sessions[user_id]["video_info"] = video_info
 
-        out_file, _ = run_pipeline(input_path, speed=speed_option,
-                                   output_path=output_path)
+        mode   = self.sessions[user_id]["mode"]
+        label  = "Slow-Mo Speed" if mode == "slowmo" else "Fix Level"
+        prefix = "slowmo"        if mode == "slowmo" else "jitter"
 
-        print("Sending result to client...")
-        buf = io.BytesIO()
-        with open(out_file, 'rb') as f:
-            buf.write(f.read())
-        buf.seek(0)
-        return send_file(buf, mimetype='video/mp4')
+        await update.message.reply_text(
+            f"✅ *Video received* ({video_info['duration']}s, {video_info['size_mb']}MB)\n\n*Choose {label}:*",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⚡ 0.5x — Fast",       callback_data=f"{prefix}_60_0.5")],
+                [InlineKeyboardButton("🔥 0.25x — Popular",  callback_data=f"{prefix}_120_0.25")],
+                [InlineKeyboardButton("💎 0.125x — Extreme", callback_data=f"{prefix}_240_0.125")],
+                [InlineKeyboardButton("◀️ Cancel",           callback_data="back_to_menu")]
+            ]),
+            parse_mode='Markdown'
+        )
 
-    except Exception as e:
-        print(f"Error: {e}")
-        import traceback; traceback.print_exc()
-        return {"error": str(e)}, 500
+    async def add_to_queue(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query   = update.callback_query
+        await safe_answer(query)
+        user_id = update.effective_user.id
 
-    finally:
-        for p in [input_path, output_path]:
-            if os.path.exists(p):
-                os.remove(p)
-
-
-# ══════════════════════════════════════════════════════════════
-# Startup
-# ══════════════════════════════════════════════════════════════
-
-def get_free_port(start=5000):
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    p = start
-    while True:
         try:
-            s.bind(('127.0.0.1', p)); s.close(); return p
-        except OSError:
-            p += 1
+            parts = query.data.split("_", maxsplit=2)
+            mode, target_fps, slowmo_factor = parts[0], int(parts[1]), float(parts[2])
+        except (IndexError, ValueError):
+            await query.edit_message_text("❌ Invalid selection. Please try again with /start")
+            return
 
-def start_backend():
-    ngrok.kill()
-    port = get_free_port()
-    try:
-        url = ngrok.connect(port).public_url
-        print("\n" + "=" * 60)
-        print("MASIF BACKEND IS LIVE")
-        print(f"Endpoint : {url}/process")
-        print("Paste this URL into your bot .env as COLAB_BACKEND_URL")
-        print("=" * 60 + "\n")
-        app.run(port=port, debug=False, use_reloader=False)
-    except Exception as e:
-        print(f"ngrok error: {e}")
+        if user_id not in self.sessions or "video_info" not in self.sessions.get(user_id, {}):
+            await query.edit_message_text(
+                "⚠️ Session expired. Please /start again and re-upload your video.",
+                parse_mode='Markdown'
+            )
+            return
+
+        video_info = self.sessions[user_id]["video_info"]
+        params     = {"mode": mode, "target_fps": target_fps, "slowmo_factor": slowmo_factor}
+
+        success, result = self.queue.add_to_queue(user_id, video_info, params, context.bot)
+        if not success:
+            await query.edit_message_text(f"❌ {result}")
+            return
+
+        position     = result
+        wait_time    = self.queue.get_wait_time(position)
+        wait_display = f"~{wait_time // 60}m {wait_time % 60}s" if wait_time > 0 else "Starting now"
+
+        await query.edit_message_text(
+            f"✅ *Queued!*\n\n"
+            f"Position: #{position}\n"
+            f"Est. wait: {wait_display}\n\n"
+            f"_You'll be notified when processing starts._",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Menu", callback_data="back_to_menu")]]),
+            parse_mode='Markdown'
+        )
+
+        if not self.queue.is_processing:
+            await self.queue.process_next(self)
+
+    async def cancel_request(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        if query:
+            await safe_answer(query)
+        user_id = update.effective_user.id
+
+        if self.queue.is_user_processing(user_id):
+            self.queue.cancel_processing(user_id)
+            text = (
+                "⏳ *Cancellation requested.*\n\n"
+                "Will stop after current step and delete all files.\n"
+                "_May take up to 30 seconds._"
+            )
+        elif self.queue.cancel_queued(user_id):
+            text = "🗑️ *Cancelled.* Removed from queue and files deleted."
+        else:
+            text = "ℹ️ No active request found."
+
+        keyboard = [[InlineKeyboardButton("◀️ Menu", callback_data="back_to_menu")]]
+        if query:
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        else:
+            await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+    async def cancel_active(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query   = update.callback_query
+        await safe_answer(query)
+        user_id = update.effective_user.id
+
+        if self.queue.is_user_processing(user_id):
+            self.queue.cancel_processing(user_id)
+            await query.edit_message_text(
+                "⏳ *Cancellation requested.*\n\n"
+                "Stopping backend and deleting your files from the server.\n"
+                "_Please wait a few seconds..._",
+                parse_mode='Markdown'
+            )
+        else:
+            await query.edit_message_text("ℹ️ Nothing is currently processing for you.", 
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Menu", callback_data="back_to_menu")]])
+            )
+
+    async def queue_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        if query:
+            await safe_answer(query)
+        user_id = update.effective_user.id
+
+        processing = self.queue.is_user_processing(user_id)
+        position   = self.queue.get_queue_position(user_id)
+
+        if processing:
+            elapsed   = (datetime.now() - self.queue.processing_start_time).seconds
+            remaining = max(0, self.queue.estimated_time_per_video - elapsed)
+            text      = (
+                f"*Your video is processing now*\n\n"
+                f"⏱️ ~{remaining // 60}m {remaining % 60}s remaining"
+            )
+            keyboard = [
+                [InlineKeyboardButton("❌ Cancel Request", callback_data="cancel_active")],
+                [InlineKeyboardButton("◀️ Menu",            callback_data="back_to_menu")]
+            ]
+        elif position:
+            wait     = self.queue.get_wait_time(position)
+            text     = f"*Queue position: #{position}*\n\nEst. wait: ~{wait // 60}m {wait % 60}s"
+            keyboard = [
+                [InlineKeyboardButton("❌ Cancel Request", callback_data="cancel_request")],
+                [InlineKeyboardButton("◀️ Menu",            callback_data="back_to_menu")]
+            ]
+        else:
+            text     = f"*Queue Status*\n\n{self.queue.get_queue_info()}"
+            keyboard = [[InlineKeyboardButton("◀️ Menu", callback_data="back_to_menu")]]
+
+        if query:
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        else:
+            await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+    async def send_to_colab(self, queue_item):
+        bot         = queue_item["bot"]
+        user_id     = queue_item["user_id"]
+        output_file = None
+        video_sent  = False
+        msg_id      = None
+        start_time  = time.time()
+        ticker_task = None
+
+        try:
+            # ── Stage 0: Download ─────────────────────────────────────────
+            msg_id = await send_stage(bot, user_id, stage_idx=0, elapsed="0s")
+
+            # FIX 1: Extensive timeouts added to avoid Telegram API read exceptions
+            tg_file  = await bot.get_file(
+                queue_item["video_info"]["file_id"],
+                read_timeout=60,
+                write_timeout=60,
+                connect_timeout=60
+            )
+            file_url = tg_file.file_path
+
+            input_file = f"input_{user_id}_{int(time.time())}.mp4"
+            queue_item["input_file"] = input_file
+
+            async with aiohttp.ClientSession() as dl:
+                async with dl.get(file_url) as r:
+                    with open(input_file, 'wb') as f:
+                        f.write(await r.read())
+
+            if self.queue.is_cancelled(user_id):
+                return False
+
+            # ── Stage 1: Send to backend ──────────────────────────────────
+            elapsed = format_elapsed(time.time() - start_time)
+            await edit_stage(bot, user_id, msg_id, stage_idx=1, elapsed=elapsed,
+                             sub=f"Speed: {queue_item['processing_params']['slowmo_factor']}x")
+
+            payload = {
+                "video_url": file_url,
+                "speed":     str(queue_item["processing_params"]["slowmo_factor"])
+            }
+
+            # Extended wait time for Colab to finish heavy GPU tasks (30 minutes max)
+            timeout = aiohttp.ClientTimeout(total=1800)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    self.colab_url,
+                    json=payload,
+                    headers={
+                        "User-Agent":                "Mozilla/5.0",
+                        "ngrok-skip-browser-warning": "69420",
+                        "Content-Type":              "application/json",
+                        "Accept":                    "application/json"
+                    }
+                ) as response:
+
+                    if self.queue.is_cancelled(user_id):
+                        return False
+
+                    if response.status == 200:
+                        # ── Stage 2: AI running — live ticker ─────────────
+                        elapsed = format_elapsed(time.time() - start_time)
+                        await edit_stage(bot, user_id, msg_id, stage_idx=2, elapsed=elapsed)
+                        
+                        # Start our interactive loading animation
+                        ticker_task = asyncio.create_task(
+                            run_live_ticker(bot, user_id, msg_id, start_time)
+                        )
+
+                        video_bytes = await response.read()
+
+                        # Stop the animation once backend replies
+                        ticker_task.cancel()
+                        try:
+                            await ticker_task
+                        except asyncio.CancelledError:
+                            pass
+                        ticker_task = None
+
+                        if self.queue.is_cancelled(user_id):
+                            return False
+
+                        # ── Stage 3: Save encoded file ────────────────────
+                        elapsed = format_elapsed(time.time() - start_time)
+                        await edit_stage(bot, user_id, msg_id, stage_idx=3, elapsed=elapsed)
+
+                        ts          = int(time.time())
+                        output_file = f"masif_{user_id}_{ts}.mp4"
+                        queue_item["output_file"] = output_file
+                        with open(output_file, 'wb') as f:
+                            f.write(video_bytes)
+
+                        # ── Stage 4: Upload ───────────────────────────────
+                        elapsed = format_elapsed(time.time() - start_time)
+                        await edit_stage(bot, user_id, msg_id, stage_idx=4, elapsed=elapsed)
+
+                        with open(output_file, 'rb') as v:
+                            # FIX 2: Massive 300-second timeouts for sending final video to user
+                            await bot.send_video(
+                                chat_id=user_id,
+                                video=v,
+                                caption=f"✨ *Your MASIF result* — generated in {elapsed}!",
+                                parse_mode='Markdown',
+                                read_timeout=300,
+                                write_timeout=300,
+                                connect_timeout=60
+                            )
+
+                        video_sent = True
+                        os.remove(output_file)
+                        queue_item["output_file"] = None
+
+                        try:
+                            await bot.delete_message(chat_id=user_id, message_id=msg_id)
+                        except Exception:
+                            pass
+
+                        await bot.send_message(
+                            user_id,
+                            f"✅ *Success!* Temporary files have been securely deleted.",
+                            parse_mode='Markdown'
+                        )
+                        return True
+
+                    else:
+                        err = await response.text()
+                        print(f"❌ Backend error {response.status}: {err[:200]}")
+                        try:
+                            await bot.delete_message(chat_id=user_id, message_id=msg_id)
+                        except Exception:
+                            pass
+                        return False
+
+        except asyncio.TimeoutError:
+            if video_sent:
+                return True
+            try:
+                await bot.delete_message(chat_id=user_id, message_id=msg_id)
+            except Exception:
+                pass
+            await bot.send_message(user_id,
+                "⏰ *Processing timed out.* The video was too large or complex for the server to finish in time.",
+                parse_mode='Markdown'
+            )
+            return False
+
+        except aiohttp.ClientConnectorError:
+            try:
+                await bot.delete_message(chat_id=user_id, message_id=msg_id)
+            except Exception:
+                pass
+            await bot.send_message(user_id,
+                "🔌 *Backend offline.* The Colab/Kaggle server is not currently running.",
+                parse_mode='Markdown'
+            )
+            return False
+
+        except aiohttp.ServerDisconnectedError:
+            if video_sent:
+                return True
+            return False
+
+        except Exception as e:
+            print(f"❌ send_to_colab error: {e}")
+            if video_sent:
+                return True
+            try:
+                await bot.delete_message(chat_id=user_id, message_id=msg_id)
+            except Exception:
+                pass
+            return False
+
+        finally:
+            if ticker_task and not ticker_task.done():
+                ticker_task.cancel()
+            input_file = queue_item.get("input_file")
+            if input_file and os.path.exists(input_file):
+                os.remove(input_file)
+            queue_item["input_file"] = None
+
+    async def back_to_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await safe_answer(query)
+        await self.start(update, context)
+
+    async def cancel_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await self.cancel_request(update, context)
+
+    async def queue_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await self.queue_status(update, context)
+
+    async def setup_commands(self, application: Application):
+        await application.bot.set_my_commands([
+            BotCommand("start",  "Open main menu"),
+            BotCommand("queue",  "Check your queue position"),
+            BotCommand("cancel", "Cancel & delete your request"),
+        ])
+
+    def run(self):
+        app = Application.builder().token(self.token).post_init(self.setup_commands).build()
+
+        app.add_handler(CommandHandler("start",  self.start))
+        app.add_handler(CommandHandler("queue",  self.queue_command))
+        app.add_handler(CommandHandler("cancel", self.cancel_command))
+
+        app.add_handler(CallbackQueryHandler(self.how_it_works,        pattern="^how_it_works$"))
+        app.add_handler(CallbackQueryHandler(self.create_slowmo_start, pattern="^create_slowmo$"))
+        app.add_handler(CallbackQueryHandler(self.fix_jitter_start,    pattern="^fix_jitter$"))
+        app.add_handler(CallbackQueryHandler(self.queue_status,        pattern="^queue_status$"))
+        app.add_handler(CallbackQueryHandler(self.cancel_request,      pattern="^cancel_request$"))
+        app.add_handler(CallbackQueryHandler(self.cancel_active,       pattern="^cancel_active$"))
+        app.add_handler(CallbackQueryHandler(self.back_to_menu,        pattern="^back_to_menu$"))
+        app.add_handler(CallbackQueryHandler(self.add_to_queue,        pattern="^slowmo_"))
+        app.add_handler(CallbackQueryHandler(self.add_to_queue,        pattern="^jitter_"))
+
+        app.add_handler(MessageHandler(filters.VIDEO, self.handle_video))
+
+        print("🤖 Bot running. Colab/Kaggle backend must also be active for processing.")
+        app.run_polling()
+
 
 if __name__ == "__main__":
-    start_backend()
+    # Start the Flask health check in the background first
+    Thread(target=run_flask, daemon=True).start()
+    
+    # Start the Telegram Bot
+    bot = SlowMoBot()
+    bot.run()
