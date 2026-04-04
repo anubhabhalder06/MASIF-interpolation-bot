@@ -5,8 +5,8 @@ import time
 import logging
 from datetime import datetime
 from collections import deque
-from threading import Thread # Added for Render
-from flask import Flask      # Added for Render
+from threading import Thread
+from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from telegram.error import TimedOut, NetworkError
@@ -15,9 +15,7 @@ from dotenv import load_dotenv
 load_dotenv()
 logging.basicConfig(level=logging.WARNING)
 
-# ──────────────────────────────────────────────
 # Render Health Check (Keeps the bot alive)
-# ──────────────────────────────────────────────
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
@@ -25,17 +23,13 @@ def health_check():
     return "MASIF Bot is alive!", 200
 
 def run_flask():
-    # Disable flask logs to keep your Render console clean
     log = logging.getLogger('werkzeug')
     log.setLevel(logging.ERROR)
-    
     port = int(os.environ.get("PORT", 8080))
     flask_app.run(host='0.0.0.0', port=port)
 
 
-# ──────────────────────────────────────────────
 # Safe query.answer() — never crashes on timeout
-# ──────────────────────────────────────────────
 async def safe_answer(query):
     try:
         await query.answer()
@@ -45,13 +39,10 @@ async def safe_answer(query):
         pass
 
 
-# ──────────────────────────────────────────────
-# Animated progress system (Upgraded UI)
-# ──────────────────────────────────────────────
+# Animated progress system
 
 SPINNER = ["🌑", "🌒", "🌓", "🌔", "🌕", "🌖", "🌗", "🌘"]
 
-# Waveform that scrolls left — renders nicely in monospace
 WAVE_FRAMES = [
     "▁▂▄▆█▆▄▂▁▂▄▆█",
     "▂▄▆█▆▄▂▁▂▄▆█▆",
@@ -63,7 +54,6 @@ WAVE_FRAMES = [
     "▂▁▂▄▆█▆▄▂▁▂▄▆",
 ]
 
-# GPU load bar that fluctuates realistically
 GPU_BARS = [
     "████████░░  82%",
     "█████████░  91%",
@@ -76,9 +66,6 @@ GPU_BARS = [
     "████████░░  80%",
     "██████████  100%",
 ]
-
-# Kept for non-AI stages (simple left-right sweep)
-PULSE_BAR = ["[=    ]", "[ =   ]", "[  =  ]", "[   = ]", "[    =]", "[    =]", "[   = ]", "[  =  ]", "[ =   ]", "[=    ]"]
 
 PIPELINE_STAGES = [
     (1, "📥", "Downloading your video"),
@@ -114,18 +101,23 @@ def format_elapsed(seconds: float) -> str:
     return f"{m}m {sec}s"
 
 def _make_text(spin_char: str, stage_num: int, emoji: str,
-               label: str, elapsed: str, sub: str = "", pulse_idx: int = 0) -> str:
+               label: str, elapsed: str, sub: str = "",
+               pulse_idx: int = 0, ai_elapsed: float = 0) -> str:
 
     if stage_num == 3:
-        # ── Dynamic AI stage ──────────────────────────────────────────────
-        wave      = WAVE_FRAMES[pulse_idx % len(WAVE_FRAMES)]
-        gpu_bar   = GPU_BARS[pulse_idx % len(GPU_BARS)]
-        # Fake frame counter — ramps up naturally, caps at 999
-        frames    = min(pulse_idx * 17 + (pulse_idx % 6) * 4, 999)
+        wave     = WAVE_FRAMES[pulse_idx % len(WAVE_FRAMES)]
+        gpu_bar  = GPU_BARS[pulse_idx % len(GPU_BARS)]
+        frames   = min(pulse_idx * 17 + (pulse_idx % 6) * 4, 999)
+
+        # Smooth bar based on real time in AI stage — assumes ~180s typical job
+        pct      = min(90, int(ai_elapsed / 180 * 100))
+        filled   = pct // 5   # 20-block bar
+        prog_bar = "█" * filled + "░" * (20 - filled)
 
         text = (
             f"{spin_char}  *MASIF — AI Processing*\n\n"
-            f"`{wave}`\n\n"
+            f"`{prog_bar}` {pct}%\n\n"
+            f"`{wave}`\n"
             f"🖥️  GPU    `{gpu_bar}`\n"
             f"🎞️  Frames  `{frames:04d}` interpolated\n\n"
             f"{emoji}  *{label}*"
@@ -135,9 +127,8 @@ def _make_text(spin_char: str, stage_num: int, emoji: str,
         text += f"\n\n⏱  *Time elapsed:* `{elapsed}`"
 
     else:
-        # ── Standard stage ────────────────────────────────────────────────
-        bar     = build_bar(stage_num)
-        pct     = int(stage_num / len(PIPELINE_STAGES) * 100)
+        bar  = build_bar(stage_num)
+        pct  = int(stage_num / len(PIPELINE_STAGES) * 100)
         text = (
             f"{spin_char}  *MASIF is processing your video*\n\n"
             f"`{bar}` {pct}%\n\n"
@@ -149,7 +140,6 @@ def _make_text(spin_char: str, stage_num: int, emoji: str,
 
     return text
 
-# Includes the Cancel button directly on the loading screen
 CANCEL_KEYBOARD = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Processing", callback_data="cancel_active")]])
 
 async def send_stage(bot, user_id: int, stage_idx: int,
@@ -160,59 +150,75 @@ async def send_stage(bot, user_id: int, stage_idx: int,
     return msg.message_id
 
 async def edit_stage(bot, user_id: int, msg_id: int, stage_idx: int,
-                     spin_idx: int = 0, elapsed: str = "0s", sub: str = "", pulse_idx: int = 0):
+                     spin_idx: int = 0, elapsed: str = "0s", sub: str = "",
+                     pulse_idx: int = 0, ai_elapsed: float = 0):
     _, emoji, label = PIPELINE_STAGES[stage_idx]
     spin = SPINNER[spin_idx % len(SPINNER)]
-    text = _make_text(spin, stage_idx + 1, emoji, label, elapsed, sub, pulse_idx)
+    text = _make_text(spin, stage_idx + 1, emoji, label, elapsed, sub, pulse_idx, ai_elapsed)
     try:
         await bot.edit_message_text(
             chat_id=user_id, message_id=msg_id,
             text=text, reply_markup=CANCEL_KEYBOARD, parse_mode='Markdown'
         )
     except Exception:
-        pass # Ignore "Message is not modified" errors from Telegram
+        pass
 
-async def run_live_ticker(bot, user_id: int, msg_id: int, start_time: float):
+async def run_live_ticker(bot, user_id: int, msg_id: int,
+                          start_time: float, stage_ref: list):
     """
-    Edits the progress message every 2.5 seconds while the backend runs.
+    Runs from the first message to the last.
+    stage_ref[0] is updated by send_to_colab as stages change.
+    Elapsed time ticks live for every stage. AI stage gets smooth fill bar.
     """
-    spin_idx = 0
+    spin_idx  = 0
     pulse_idx = 0
-    msg_idx  = 0
+    msg_idx   = 0
+    ai_start  = None
+
     try:
         while True:
             await asyncio.sleep(2.5)
-            elapsed = format_elapsed(time.time() - start_time)
-            sub     = WHILE_YOU_WAIT[msg_idx % len(WHILE_YOU_WAIT)]
-            
+            now     = time.time()
+            elapsed = format_elapsed(now - start_time)
+            stage   = stage_ref[0]
+
+            if stage == 2:
+                if ai_start is None:
+                    ai_start = now
+                ai_elapsed = now - ai_start
+                sub        = WHILE_YOU_WAIT[msg_idx % len(WHILE_YOU_WAIT)]
+                pulse_idx += 1
+                if spin_idx % 6 == 0:
+                    msg_idx += 1
+            else:
+                ai_start   = None
+                ai_elapsed = 0
+                sub        = ""
+
             await edit_stage(bot, user_id, msg_id,
-                             stage_idx=2, # Stage 3 (AI processing)
+                             stage_idx=stage,
                              spin_idx=spin_idx,
                              elapsed=elapsed,
                              sub=sub,
-                             pulse_idx=pulse_idx)
+                             pulse_idx=pulse_idx,
+                             ai_elapsed=ai_elapsed)
             spin_idx += 1
-            pulse_idx += 1
-            
-            # Rotate fun message every 6 ticks (~15s)
-            if spin_idx % 6 == 0:  
-                msg_idx += 1
+
     except asyncio.CancelledError:
         pass
 
 
-# ──────────────────────────────────────────────
 # Queue
-# ──────────────────────────────────────────────
+
 
 class VideoProcessingQueue:
     def __init__(self):
-        self.waiting_queue             = deque()
-        self.is_processing             = False
-        self.current_user              = None
-        self.processing_start_time     = None
-        self.estimated_time_per_video  = 180
-        self.max_queue_size            = 50
+        self.waiting_queue               = deque()
+        self.is_processing               = False
+        self.current_user                = None
+        self.processing_start_time       = None
+        self.estimated_time_per_video    = 180
+        self.max_queue_size              = 50
         self.cancelled_during_processing = set()
 
     def add_to_queue(self, user_id, video_info, processing_params, bot):
@@ -293,8 +299,6 @@ class VideoProcessingQueue:
             self.is_processing         = True
             self.current_user          = self.waiting_queue[0]
             self.processing_start_time = datetime.now()
-            bot = self.current_user["bot"]
-
             asyncio.create_task(self._process(bot_instance))
 
     async def _process(self, bot_instance):
@@ -328,9 +332,8 @@ class VideoProcessingQueue:
             await self.process_next(bot_instance)
 
 
-# ──────────────────────────────────────────────
+
 # Bot
-# ──────────────────────────────────────────────
 
 class SlowMoBot:
     def __init__(self):
@@ -359,10 +362,10 @@ class SlowMoBot:
         )
         keyboard = [
             [InlineKeyboardButton("🎬 Slow-Mo",      callback_data="create_slowmo"),
-             InlineKeyboardButton("🔄 Fix Jitter",  callback_data="fix_jitter")],
-            [InlineKeyboardButton("📊 Queue",        callback_data="queue_status"),
-             InlineKeyboardButton("❌ Cancel",       callback_data="cancel_request")],
-            [InlineKeyboardButton("❓ How it works", callback_data="how_it_works")]
+             InlineKeyboardButton("🔄 Fix Jitter",   callback_data="fix_jitter")],
+            [InlineKeyboardButton("📊 Queue",         callback_data="queue_status"),
+             InlineKeyboardButton("❌ Cancel",        callback_data="cancel_request")],
+            [InlineKeyboardButton("❓ How it works",  callback_data="how_it_works")]
         ]
         if update.message:
             await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
@@ -465,9 +468,9 @@ class SlowMoBot:
             f"✅ *Video received* ({video_info['duration']}s, {video_info['size_mb']}MB)\n\n*Choose {label}:*",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("⚡ 0.5x — Fast",       callback_data=f"{prefix}_60_0.5")],
-                [InlineKeyboardButton("🔥 0.25x — Popular",  callback_data=f"{prefix}_120_0.25")],
-                [InlineKeyboardButton("💎 0.125x — Extreme", callback_data=f"{prefix}_240_0.125")],
-                [InlineKeyboardButton("◀️ Cancel",           callback_data="back_to_menu")]
+                [InlineKeyboardButton("🔥 0.25x — Popular",   callback_data=f"{prefix}_120_0.25")],
+                [InlineKeyboardButton("💎 0.125x — Extreme",  callback_data=f"{prefix}_240_0.125")],
+                [InlineKeyboardButton("◀️ Cancel",            callback_data="back_to_menu")]
             ]),
             parse_mode='Markdown'
         )
@@ -553,7 +556,8 @@ class SlowMoBot:
                 parse_mode='Markdown'
             )
         else:
-            await query.edit_message_text("ℹ️ Nothing is currently processing for you.", 
+            await query.edit_message_text(
+                "ℹ️ Nothing is currently processing for you.",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Menu", callback_data="back_to_menu")]])
             )
 
@@ -575,14 +579,14 @@ class SlowMoBot:
             )
             keyboard = [
                 [InlineKeyboardButton("❌ Cancel Request", callback_data="cancel_active")],
-                [InlineKeyboardButton("◀️ Menu",            callback_data="back_to_menu")]
+                [InlineKeyboardButton("◀️ Menu",           callback_data="back_to_menu")]
             ]
         elif position:
             wait     = self.queue.get_wait_time(position)
             text     = f"*Queue position: #{position}*\n\nEst. wait: ~{wait // 60}m {wait % 60}s"
             keyboard = [
                 [InlineKeyboardButton("❌ Cancel Request", callback_data="cancel_request")],
-                [InlineKeyboardButton("◀️ Menu",            callback_data="back_to_menu")]
+                [InlineKeyboardButton("◀️ Menu",           callback_data="back_to_menu")]
             ]
         else:
             text     = f"*Queue Status*\n\n{self.queue.get_queue_info()}"
@@ -604,9 +608,12 @@ class SlowMoBot:
 
         try:
             # ── Stage 0: Download ─────────────────────────────────────────
-            msg_id = await send_stage(bot, user_id, stage_idx=0, elapsed="0s")
+            msg_id    = await send_stage(bot, user_id, stage_idx=0, elapsed="0s")
+            stage_ref = [0]
+            ticker_task = asyncio.create_task(
+                run_live_ticker(bot, user_id, msg_id, start_time, stage_ref)
+            )
 
-            # FIX 1: Extensive timeouts added to avoid Telegram API read exceptions
             tg_file  = await bot.get_file(
                 queue_item["video_info"]["file_id"],
                 read_timeout=60,
@@ -627,6 +634,7 @@ class SlowMoBot:
                 return False
 
             # ── Stage 1: Send to backend ──────────────────────────────────
+            stage_ref[0] = 1
             elapsed = format_elapsed(time.time() - start_time)
             await edit_stage(bot, user_id, msg_id, stage_idx=1, elapsed=elapsed,
                              sub=f"Speed: {queue_item['processing_params']['slowmo_factor']}x")
@@ -636,7 +644,6 @@ class SlowMoBot:
                 "speed":     str(queue_item["processing_params"]["slowmo_factor"])
             }
 
-            # Extended wait time for Colab to finish heavy GPU tasks (30 minutes max)
             timeout = aiohttp.ClientTimeout(total=1800)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
@@ -654,29 +661,17 @@ class SlowMoBot:
                         return False
 
                     if response.status == 200:
-                        # ── Stage 2: AI running — live ticker ─────────────
-                        elapsed = format_elapsed(time.time() - start_time)
-                        await edit_stage(bot, user_id, msg_id, stage_idx=2, elapsed=elapsed)
-                        
-                        # Start our interactive loading animation
-                        ticker_task = asyncio.create_task(
-                            run_live_ticker(bot, user_id, msg_id, start_time)
-                        )
+                        # ── Stage 2: AI running ───────────────────────────
+                        stage_ref[0] = 2
+                        # Ticker handles all updates from here automatically
 
                         video_bytes = await response.read()
-
-                        # Stop the animation once backend replies
-                        ticker_task.cancel()
-                        try:
-                            await ticker_task
-                        except asyncio.CancelledError:
-                            pass
-                        ticker_task = None
 
                         if self.queue.is_cancelled(user_id):
                             return False
 
                         # ── Stage 3: Save encoded file ────────────────────
+                        stage_ref[0] = 3
                         elapsed = format_elapsed(time.time() - start_time)
                         await edit_stage(bot, user_id, msg_id, stage_idx=3, elapsed=elapsed)
 
@@ -687,11 +682,11 @@ class SlowMoBot:
                             f.write(video_bytes)
 
                         # ── Stage 4: Upload ───────────────────────────────
+                        stage_ref[0] = 4
                         elapsed = format_elapsed(time.time() - start_time)
                         await edit_stage(bot, user_id, msg_id, stage_idx=4, elapsed=elapsed)
 
                         with open(output_file, 'rb') as v:
-                            # FIX 2: Massive 300-second timeouts for sending final video to user
                             await bot.send_video(
                                 chat_id=user_id,
                                 video=v,
@@ -713,7 +708,7 @@ class SlowMoBot:
 
                         await bot.send_message(
                             user_id,
-                            f"✅ *Success!* Temporary files have been securely deleted.",
+                            "✅ *Success!* Temporary files have been securely deleted.",
                             parse_mode='Markdown'
                         )
                         return True
@@ -816,9 +811,6 @@ class SlowMoBot:
 
 
 if __name__ == "__main__":
-    # Start the Flask health check in the background first
     Thread(target=run_flask, daemon=True).start()
-    
-    # Start the Telegram Bot
     bot = SlowMoBot()
     bot.run()
