@@ -11,13 +11,25 @@
 
 ---
 
-## Demo
+## Why MASIF is Different
 
 <p align="center">
   <img src="demo.gif" alt="MASIF AI Slow Motion Demo" width="100%" />
 </p>
 
 > **AI-powered smooth interpolation:** MASIF generates genuine new frames to transform standard video into cinematic slow-motion.
+
+---
+
+## What Makes MASIF Unique
+
+Most tools that use Google's FILM model just wrap it and run it uniformly on every frame — no intelligence, no scheduling, no delivery system. MASIF is different in three ways:
+
+**I-01 · Adaptive Motion-Aware Scheduling** — Before interpolating, MASIF analyses every frame pair using optical flow and classifies motion as low, medium, or high. It then applies 1×, 2×, or 3× FILM passes per segment accordingly. Static scenes don't waste compute. Fast scenes get the passes they actually need. No existing open-source FILM wrapper does this.
+
+**I-02 · Visual Speed-Curve Editor** *(in progress)* — A Gradio interface where you draw a curve to control which part of the video slows down and by how much — like After Effects' time-remapping, but completely free and open-source. First implementation of its kind on top of FILM.
+
+**I-03 · Telegram Delivery** — The entire GPU pipeline runs on the cloud. Users just send a video in Telegram and receive slow-mo back. No install, no account, no local GPU needed. First ML-heavy video pipeline deployed this way.
 
 ---
 
@@ -41,17 +53,7 @@ The entire pipeline runs on **free Kaggle/Colab GPU**, and users interact with i
 
 ---
 
-## What Makes MASIF Unique
 
-Most tools that use Google's FILM model just wrap it and run it uniformly on every frame — no intelligence, no scheduling, no delivery system. MASIF is different in three ways:
-
-**I-01 · Adaptive Motion-Aware Scheduling** — Before interpolating, MASIF analyses every frame pair using optical flow and classifies motion as low, medium, or high. It then applies 1×, 2×, or 3× FILM passes per segment accordingly. Static scenes don't waste compute. Fast scenes get the passes they actually need. No existing open-source FILM wrapper does this.
-
-**I-02 · Visual Speed-Curve Editor** *(in progress)* — A Gradio interface where you draw a curve to control which part of the video slows down and by how much — like After Effects' time-remapping, but completely free and open-source. First implementation of its kind on top of FILM.
-
-**I-03 · Telegram Delivery** — The entire GPU pipeline runs on the cloud. Users just send a video in Telegram and receive slow-mo back. No install, no account, no local GPU needed. First ML-heavy video pipeline deployed this way.
-
----
 
 ## System Architecture
 
@@ -99,7 +101,7 @@ masif/
 │   └── MASIF_backend.py    # Full Colab/Kaggle backend — FILM model + Flask + ngrok
 │
 ├── requirements.txt        # Python dependencies for the Telegram bot
-├── Procfile                # Railway deployment entry point
+├── Procfile                # Render deployment entry point
 ├── railway.toml            # Railway config
 └── README.md               # This file
 ```
@@ -127,9 +129,9 @@ This is where the actual AI processing happens. It needs a GPU.
 
 6. Copy this URL into your `.env` as `COLAB_BACKEND_URL`
 
-> **Note:** The Colab backend needs to be running for video processing to work. The Telegram bot can run 24/7 on Railway independently — it will queue requests and attempt processing whenever the backend is live.
+> **Note:** The Colab backend needs to be running for video processing to work. The Telegram bot can run 24/7 on Render independently — it will queue requests and attempt processing whenever the backend is live.
 
-### Part 2 — The Telegram Bot (Railway — runs 24/7)
+### Part 2 — The Telegram Bot (Render — runs 24/7)
 
 **Option A: Run locally (for testing)**
 
@@ -142,21 +144,24 @@ cp bot/.env.example bot/.env
 python bot/bot.py
 ```
 
-**Option B: Deploy to Railway (recommended — stays alive always)**
+**Option B: Deploy to Render (recommended — stays alive always)**
 
-1. Go to [railway.app](https://railway.app) and sign up free
-2. Click **New Project → Deploy from GitHub repo**
+1. Go to [render.com](https://render.com) and sign up free
+2. Click **New → Web Service**
 3. Connect your GitHub account and select this repo
-4. Go to **Variables** and add:
+4. Set the following:
+   - **Build Command:** `pip install -r requirements.txt`
+   - **Start Command:** `python bot/bot.py`
+5. Go to **Environment** and add:
 
 ```
 TELEGRAM_BOT_TOKEN=your_token_here
 COLAB_BACKEND_URL=https://your-ngrok-url.ngrok-free.app/process
 ```
 
-5. Railway auto-deploys. Your bot is now online 24/7 — even when your laptop is off.
+6. Click **Deploy**. Your bot is now online 24/7 — even when your laptop is off.
 
-> **Updating the backend URL:** Every time you restart Colab (unless you have a static ngrok domain), the URL changes. Just update `COLAB_BACKEND_URL` in Railway Variables and redeploy.
+> **Updating the backend URL:** Every time you restart Colab (unless you have a static ngrok domain), the URL changes. Just update `COLAB_BACKEND_URL` in your Render service's Environment settings and redeploy.
 
 ---
 
@@ -203,7 +208,7 @@ Copy `bot/.env.example` to `bot/.env` and fill in your values:
 | Bot Framework | python-telegram-bot v20 |
 | Backend Server | Flask + ngrok |
 | GPU | Google Colab / Kaggle (free) |
-| Bot Hosting | Railway |
+| Bot Hosting | Render |
 
 ---
 
@@ -244,7 +249,7 @@ MASIF includes a full async queue so multiple users can use the bot simultaneous
 - [ ] Visual speed-curve editor (Gradio UI)
 - [ ] Per-segment adaptive scheduling (full I-01 implementation)
 - [ ] Support for audio preservation in output
-- [ ] Web frontend (upload → download, no Telegram required)
+- [ ] Web frontend (upload → download)
 
 ---
 
