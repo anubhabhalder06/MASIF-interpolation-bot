@@ -1,5 +1,6 @@
-python-telegram-bot
+python-telegram-bot==20.7
+python-dotenv==1.0.1
 requests
 flask
 gunicorn
-python-dotenv
+aiohttp
