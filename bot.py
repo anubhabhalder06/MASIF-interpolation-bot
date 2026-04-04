@@ -2,38 +2,168 @@ import os
 import asyncio
 import aiohttp
 import time
+import logging
 from datetime import datetime
 from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+from telegram.error import TimedOut, NetworkError
 from dotenv import load_dotenv
 
 load_dotenv()
+logging.basicConfig(level=logging.WARNING)
 
+# ──────────────────────────────────────────────
+# Safe query.answer() — never crashes on timeout
+# ──────────────────────────────────────────────
+async def safe_answer(query):
+    try:
+        await query.answer()
+    except (TimedOut, NetworkError):
+        pass
+    except Exception:
+        pass
+
+
+# ──────────────────────────────────────────────
+# Animated progress system (Upgraded UI)
+# ──────────────────────────────────────────────
+
+SPINNER = ["🌑", "🌒", "🌓", "🌔", "🌕", "🌖", "🌗", "🌘"]
+PULSE_BAR = ["[=     ]", "[ =    ]", "[  =   ]", "[   =  ]", "[    = ]", "[     =]", "[    = ]", "[   =  ]", "[  =   ]", "[ =    ]"]
+
+PIPELINE_STAGES = [
+    (1, "📥", "Downloading your video"),
+    (2, "🚀", "Sending to AI backend"),
+    (3, "🧠", "AI is generating frames"),
+    (4, "🎬", "Encoding slow-motion video"),
+    (5, "📤", "Uploading result to you"),
+]
+
+WHILE_YOU_WAIT = [
+    "Creating frames that literally didn't exist before...",
+    "GPU cores are heating up...",
+    "Analysing motion vectors between every frame pair...",
+    "Smoothing pixel transitions with FILM AI...",
+    "Predicting where pixels *would* have been...",
+    "Interpolating with surgical precision...",
+    "The AI has seen your video and is deeply inspired...",
+    "Running optical flow calculations...",
+    "Painting in-between frames from scratch...",
+    "Kaggle/Colab GPU is sweating right now...",
+    "Almost there, formatting the temporal dimensions...",
+    "Every new frame is a tiny work of art...",
+]
+
+def build_bar(filled: int, total: int = 5) -> str:
+    return "█" * filled + "░" * (total - filled)
+
+def format_elapsed(seconds: float) -> str:
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    m, sec = divmod(s, 60)
+    return f"{m}m {sec}s"
+
+def _make_text(spin_char: str, stage_num: int, emoji: str,
+               label: str, elapsed: str, sub: str = "", pulse_idx: int = 0) -> str:
+    
+    # If we are in the AI stage, show an indeterminate pulse bar, otherwise standard progress
+    if stage_num == 3:
+        bar = PULSE_BAR[pulse_idx % len(PULSE_BAR)]
+        pct_text = "AI Working"
+    else:
+        bar  = build_bar(stage_num)
+        pct_text = f"{int(stage_num / len(PIPELINE_STAGES) * 100)}%"
+
+    text = (
+        f"{spin_char}  *MASIF is processing your video*\n\n"
+        f"`{bar}` {pct_text}\n\n"
+        f"{emoji}  *Current Stage: {label}*"
+    )
+    if sub:
+        text += f"\n_{sub}_"
+    text += f"\n\n⏱  *Time elapsed:* {elapsed}"
+    return text
+
+# Includes the Cancel button directly on the loading screen
+CANCEL_KEYBOARD = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Processing", callback_data="cancel_active")]])
+
+async def send_stage(bot, user_id: int, stage_idx: int,
+                     elapsed: str = "0s", sub: str = "") -> int:
+    _, emoji, label = PIPELINE_STAGES[stage_idx]
+    text = _make_text(SPINNER[0], stage_idx + 1, emoji, label, elapsed, sub)
+    msg  = await bot.send_message(user_id, text, reply_markup=CANCEL_KEYBOARD, parse_mode='Markdown')
+    return msg.message_id
+
+async def edit_stage(bot, user_id: int, msg_id: int, stage_idx: int,
+                     spin_idx: int = 0, elapsed: str = "0s", sub: str = "", pulse_idx: int = 0):
+    _, emoji, label = PIPELINE_STAGES[stage_idx]
+    spin = SPINNER[spin_idx % len(SPINNER)]
+    text = _make_text(spin, stage_idx + 1, emoji, label, elapsed, sub, pulse_idx)
+    try:
+        await bot.edit_message_text(
+            chat_id=user_id, message_id=msg_id,
+            text=text, reply_markup=CANCEL_KEYBOARD, parse_mode='Markdown'
+        )
+    except Exception:
+        pass # Ignore "Message is not modified" errors from Telegram
+
+async def run_live_ticker(bot, user_id: int, msg_id: int, start_time: float):
+    """
+    Edits the progress message every 2.5 seconds while the backend runs.
+    """
+    spin_idx = 0
+    pulse_idx = 0
+    msg_idx  = 0
+    try:
+        while True:
+            await asyncio.sleep(2.5)
+            elapsed = format_elapsed(time.time() - start_time)
+            sub     = WHILE_YOU_WAIT[msg_idx % len(WHILE_YOU_WAIT)]
+            
+            await edit_stage(bot, user_id, msg_id,
+                             stage_idx=2, # Stage 3 (AI processing)
+                             spin_idx=spin_idx,
+                             elapsed=elapsed,
+                             sub=sub,
+                             pulse_idx=pulse_idx)
+            spin_idx += 1
+            pulse_idx += 1
+            
+            # Rotate fun message every 6 ticks (~15s)
+            if spin_idx % 6 == 0:  
+                msg_idx += 1
+    except asyncio.CancelledError:
+        pass
+
+
+# ──────────────────────────────────────────────
+# Queue
+# ──────────────────────────────────────────────
 
 class VideoProcessingQueue:
     def __init__(self):
-        self.waiting_queue = deque()
-        self.is_processing = False
-        self.current_user = None
-        self.processing_start_time = None
-        self.estimated_time_per_video = 180
-        self.max_queue_size = 50
+        self.waiting_queue             = deque()
+        self.is_processing             = False
+        self.current_user              = None
+        self.processing_start_time     = None
+        self.estimated_time_per_video  = 180
+        self.max_queue_size            = 50
         self.cancelled_during_processing = set()
 
     def add_to_queue(self, user_id, video_info, processing_params, bot):
         if len(self.waiting_queue) >= self.max_queue_size:
             return False, "Queue is full. Try again later."
-
         position = len(self.waiting_queue) + 1
         self.waiting_queue.append({
-            "user_id": user_id,
-            "video_info": video_info,
+            "user_id":           user_id,
+            "video_info":        video_info,
             "processing_params": processing_params,
-            "joined_at": datetime.now(),
-            "bot": bot,
-            "input_file": None,
-            "output_file": None,
+            "joined_at":         datetime.now(),
+            "bot":               bot,
+            "input_file":        None,
+            "output_file":       None,
         })
         return True, position
 
@@ -48,7 +178,7 @@ class VideoProcessingQueue:
 
     def get_wait_time(self, position):
         if self.is_processing:
-            elapsed = (datetime.now() - self.processing_start_time).seconds
+            elapsed   = (datetime.now() - self.processing_start_time).seconds
             remaining = max(0, self.estimated_time_per_video - elapsed)
             return remaining + (position - 1) * self.estimated_time_per_video
         return (position - 1) * self.estimated_time_per_video
@@ -88,7 +218,7 @@ class VideoProcessingQueue:
             return "🟢 Queue is empty — instant processing available!"
         info = []
         if self.is_processing:
-            elapsed = (datetime.now() - self.processing_start_time).seconds
+            elapsed   = (datetime.now() - self.processing_start_time).seconds
             remaining = max(0, self.estimated_time_per_video - elapsed)
             info.append(f"🟡 Processing 1 video — ~{remaining // 60}m {remaining % 60}s left")
         if self.waiting_queue:
@@ -97,25 +227,15 @@ class VideoProcessingQueue:
 
     async def process_next(self, bot_instance):
         if not self.is_processing and self.waiting_queue:
-            self.is_processing = True
-            self.current_user = self.waiting_queue[0]
+            self.is_processing         = True
+            self.current_user          = self.waiting_queue[0]
             self.processing_start_time = datetime.now()
             bot = self.current_user["bot"]
 
-            keyboard = [[InlineKeyboardButton("❌ Cancel & Delete", callback_data="cancel_active")]]
-            await bot.send_message(
-                self.current_user["user_id"],
-                f"⚙️ *Processing started!*\n\n"
-                f"Speed: {self.current_user['processing_params']['slowmo_factor']}x\n"
-                f"Est. time: ~{self.estimated_time_per_video // 60} min\n\n"
-                f"_You'll receive your video automatically._",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode='Markdown'
-            )
             asyncio.create_task(self._process(bot_instance))
 
     async def _process(self, bot_instance):
-        bot = self.current_user["bot"]
+        bot     = self.current_user["bot"]
         user_id = self.current_user["user_id"]
         try:
             success = await bot_instance.send_to_colab(self.current_user)
@@ -126,14 +246,9 @@ class VideoProcessingQueue:
                     "🗑️ *Cancelled.* Your video and all files have been deleted.",
                     parse_mode='Markdown'
                 )
-            elif success:
+            elif not success:
                 await bot.send_message(user_id,
-                    "✅ *Done!* Your video is above.\n\n_All temp files deleted from server._",
-                    parse_mode='Markdown'
-                )
-            else:
-                await bot.send_message(user_id,
-                    "❌ *Processing failed.* Colab may be offline.\n\nUse /start to try again.",
+                    "❌ *Processing failed.* Colab/Kaggle may be offline.\n\nUse /start to try again.",
                     parse_mode='Markdown'
                 )
         except Exception as e:
@@ -146,13 +261,17 @@ class VideoProcessingQueue:
             self._cleanup_files(self.current_user)
             self.waiting_queue.popleft()
             self.is_processing = False
-            self.current_user = None
+            self.current_user  = None
             await self.process_next(bot_instance)
 
 
+# ──────────────────────────────────────────────
+# Bot
+# ──────────────────────────────────────────────
+
 class SlowMoBot:
     def __init__(self):
-        self.token = os.getenv("TELEGRAM_BOT_TOKEN")
+        self.token     = os.getenv("TELEGRAM_BOT_TOKEN")
         self.colab_url = os.getenv("COLAB_BACKEND_URL")
 
         if not self.token:
@@ -160,12 +279,12 @@ class SlowMoBot:
         if not self.colab_url:
             raise ValueError("COLAB_BACKEND_URL missing from .env")
 
-        self.queue = VideoProcessingQueue()
+        self.queue    = VideoProcessingQueue()
         self.sessions = {}
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
-        name = update.effective_user.first_name
+        name    = update.effective_user.first_name
 
         text = (
             f"👋 Hi {name}!\n\n"
@@ -176,10 +295,10 @@ class SlowMoBot:
             f"{self.queue.get_queue_info()}"
         )
         keyboard = [
-            [InlineKeyboardButton("🎬 Slow-Mo", callback_data="create_slowmo"),
-             InlineKeyboardButton("🔄 Fix Jitter", callback_data="fix_jitter")],
-            [InlineKeyboardButton("📊 Queue", callback_data="queue_status"),
-             InlineKeyboardButton("❌ Cancel", callback_data="cancel_request")],
+            [InlineKeyboardButton("🎬 Slow-Mo",      callback_data="create_slowmo"),
+             InlineKeyboardButton("🔄 Fix Jitter",  callback_data="fix_jitter")],
+            [InlineKeyboardButton("📊 Queue",        callback_data="queue_status"),
+             InlineKeyboardButton("❌ Cancel",       callback_data="cancel_request")],
             [InlineKeyboardButton("❓ How it works", callback_data="how_it_works")]
         ]
         if update.message:
@@ -189,14 +308,14 @@ class SlowMoBot:
 
     async def how_it_works(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
-        await query.answer()
+        await safe_answer(query)
         text = (
             "*How MASIF works*\n\n"
             "1️⃣ Send your video\n"
             "2️⃣ Choose speed / fix level\n"
-            "3️⃣ AI fills in missing frames\n"
-            "4️⃣ Receive your smooth video\n\n"
-            "⚠️ Requires Colab backend to be running."
+            "3️⃣ AI fills in missing frames using Google FILM\n"
+            "4️⃣ Receive your smooth slow-mo video\n\n"
+            "⚠️ Requires Colab/Kaggle backend to be running."
         )
         await query.edit_message_text(text,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Back", callback_data="back_to_menu")]]),
@@ -204,8 +323,8 @@ class SlowMoBot:
         )
 
     async def create_slowmo_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer()
+        query   = update.callback_query
+        await safe_answer(query)
         user_id = update.effective_user.id
 
         if self.queue.get_queue_position(user_id) or self.queue.is_user_processing(user_id):
@@ -227,8 +346,8 @@ class SlowMoBot:
         )
 
     async def fix_jitter_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer()
+        query   = update.callback_query
+        await safe_answer(query)
         user_id = update.effective_user.id
 
         if self.queue.get_queue_position(user_id) or self.queue.is_user_processing(user_id):
@@ -269,30 +388,30 @@ class SlowMoBot:
             return
 
         video_info = {
-            "file_id": video.file_id,
+            "file_id":  video.file_id,
             "duration": video.duration,
-            "size_mb": round(video.file_size / (1024 * 1024), 2),
+            "size_mb":  round(video.file_size / (1024 * 1024), 2),
         }
         self.sessions[user_id]["video_info"] = video_info
 
-        mode = self.sessions[user_id]["mode"]
-        label = "Slow-Mo Speed" if mode == "slowmo" else "Fix Level"
-        prefix = "slowmo" if mode == "slowmo" else "jitter"
+        mode   = self.sessions[user_id]["mode"]
+        label  = "Slow-Mo Speed" if mode == "slowmo" else "Fix Level"
+        prefix = "slowmo"        if mode == "slowmo" else "jitter"
 
         await update.message.reply_text(
             f"✅ *Video received* ({video_info['duration']}s, {video_info['size_mb']}MB)\n\n*Choose {label}:*",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⚡ 0.5x — Fast", callback_data=f"{prefix}_60_0.5")],
-                [InlineKeyboardButton("🔥 0.25x — Popular", callback_data=f"{prefix}_120_0.25")],
+                [InlineKeyboardButton("⚡ 0.5x — Fast",       callback_data=f"{prefix}_60_0.5")],
+                [InlineKeyboardButton("🔥 0.25x — Popular",  callback_data=f"{prefix}_120_0.25")],
                 [InlineKeyboardButton("💎 0.125x — Extreme", callback_data=f"{prefix}_240_0.125")],
-                [InlineKeyboardButton("◀️ Cancel", callback_data="back_to_menu")]
+                [InlineKeyboardButton("◀️ Cancel",           callback_data="back_to_menu")]
             ]),
             parse_mode='Markdown'
         )
 
     async def add_to_queue(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer()
+        query   = update.callback_query
+        await safe_answer(query)
         user_id = update.effective_user.id
 
         try:
@@ -310,15 +429,15 @@ class SlowMoBot:
             return
 
         video_info = self.sessions[user_id]["video_info"]
-        params = {"mode": mode, "target_fps": target_fps, "slowmo_factor": slowmo_factor}
+        params     = {"mode": mode, "target_fps": target_fps, "slowmo_factor": slowmo_factor}
 
         success, result = self.queue.add_to_queue(user_id, video_info, params, context.bot)
         if not success:
             await query.edit_message_text(f"❌ {result}")
             return
 
-        position = result
-        wait_time = self.queue.get_wait_time(position)
+        position     = result
+        wait_time    = self.queue.get_wait_time(position)
         wait_display = f"~{wait_time // 60}m {wait_time % 60}s" if wait_time > 0 else "Starting now"
 
         await query.edit_message_text(
@@ -336,7 +455,7 @@ class SlowMoBot:
     async def cancel_request(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         if query:
-            await query.answer()
+            await safe_answer(query)
         user_id = update.effective_user.id
 
         if self.queue.is_user_processing(user_id):
@@ -358,50 +477,52 @@ class SlowMoBot:
             await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
     async def cancel_active(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer()
+        query   = update.callback_query
+        await safe_answer(query)
         user_id = update.effective_user.id
 
         if self.queue.is_user_processing(user_id):
             self.queue.cancel_processing(user_id)
             await query.edit_message_text(
                 "⏳ *Cancellation requested.*\n\n"
-                "Stopping after current step. Files will be deleted.\n"
-                "_May take up to 30 seconds._",
+                "Stopping backend and deleting your files from the server.\n"
+                "_Please wait a few seconds..._",
                 parse_mode='Markdown'
             )
         else:
-            await query.edit_message_text("ℹ️ Nothing is currently processing for you.")
+            await query.edit_message_text("ℹ️ Nothing is currently processing for you.", 
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Menu", callback_data="back_to_menu")]])
+            )
 
     async def queue_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         if query:
-            await query.answer()
+            await safe_answer(query)
         user_id = update.effective_user.id
 
         processing = self.queue.is_user_processing(user_id)
-        position = self.queue.get_queue_position(user_id)
+        position   = self.queue.get_queue_position(user_id)
 
         if processing:
-            elapsed = (datetime.now() - self.queue.processing_start_time).seconds
+            elapsed   = (datetime.now() - self.queue.processing_start_time).seconds
             remaining = max(0, self.queue.estimated_time_per_video - elapsed)
-            text = (
+            text      = (
                 f"*Your video is processing now*\n\n"
                 f"⏱️ ~{remaining // 60}m {remaining % 60}s remaining"
             )
             keyboard = [
-                [InlineKeyboardButton("❌ Cancel & Delete", callback_data="cancel_active")],
-                [InlineKeyboardButton("◀️ Menu", callback_data="back_to_menu")]
+                [InlineKeyboardButton("❌ Cancel Request", callback_data="cancel_active")],
+                [InlineKeyboardButton("◀️ Menu",            callback_data="back_to_menu")]
             ]
         elif position:
-            wait = self.queue.get_wait_time(position)
-            text = f"*Queue position: #{position}*\n\nEst. wait: ~{wait // 60}m {wait % 60}s"
+            wait     = self.queue.get_wait_time(position)
+            text     = f"*Queue position: #{position}*\n\nEst. wait: ~{wait // 60}m {wait % 60}s"
             keyboard = [
-                [InlineKeyboardButton("❌ Cancel & Delete", callback_data="cancel_request")],
-                [InlineKeyboardButton("◀️ Menu", callback_data="back_to_menu")]
+                [InlineKeyboardButton("❌ Cancel Request", callback_data="cancel_request")],
+                [InlineKeyboardButton("◀️ Menu",            callback_data="back_to_menu")]
             ]
         else:
-            text = f"*Queue Status*\n\n{self.queue.get_queue_info()}"
+            text     = f"*Queue Status*\n\n{self.queue.get_queue_info()}"
             keyboard = [[InlineKeyboardButton("◀️ Menu", callback_data="back_to_menu")]]
 
         if query:
@@ -410,15 +531,25 @@ class SlowMoBot:
             await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
     async def send_to_colab(self, queue_item):
-        bot = queue_item["bot"]
-        user_id = queue_item["user_id"]
-        input_file = None
+        bot         = queue_item["bot"]
+        user_id     = queue_item["user_id"]
         output_file = None
-        video_sent = False
+        video_sent  = False
+        msg_id      = None
+        start_time  = time.time()
+        ticker_task = None
 
         try:
-            print(f"📥 Downloading video for user {user_id}...")
-            tg_file = await bot.get_file(queue_item["video_info"]["file_id"])
+            # ── Stage 0: Download ─────────────────────────────────────────
+            msg_id = await send_stage(bot, user_id, stage_idx=0, elapsed="0s")
+
+            # FIX 1: Extensive timeouts added to avoid Telegram API read exceptions
+            tg_file  = await bot.get_file(
+                queue_item["video_info"]["file_id"],
+                read_timeout=60,
+                write_timeout=60,
+                connect_timeout=60
+            )
             file_url = tg_file.file_path
 
             input_file = f"input_{user_id}_{int(time.time())}.mp4"
@@ -432,87 +563,157 @@ class SlowMoBot:
             if self.queue.is_cancelled(user_id):
                 return False
 
-            print(f"🔗 Sending to Colab...")
+            # ── Stage 1: Send to backend ──────────────────────────────────
+            elapsed = format_elapsed(time.time() - start_time)
+            await edit_stage(bot, user_id, msg_id, stage_idx=1, elapsed=elapsed,
+                             sub=f"Speed: {queue_item['processing_params']['slowmo_factor']}x")
+
             payload = {
                 "video_url": file_url,
-                "speed": str(queue_item["processing_params"]["slowmo_factor"])
+                "speed":     str(queue_item["processing_params"]["slowmo_factor"])
             }
 
-            timeout = aiohttp.ClientTimeout(total=600)
+            # Extended wait time for Colab to finish heavy GPU tasks (30 minutes max)
+            timeout = aiohttp.ClientTimeout(total=1800)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
                     self.colab_url,
                     json=payload,
                     headers={
-                        "User-Agent": "Mozilla/5.0",
-                        "ngrok-skip-browser-warning": "true",
-                        "Content-Type": "application/json"
-                    },
-                    ssl=False
+                        "User-Agent":                "Mozilla/5.0",
+                        "ngrok-skip-browser-warning": "69420",
+                        "Content-Type":              "application/json",
+                        "Accept":                    "application/json"
+                    }
                 ) as response:
 
                     if self.queue.is_cancelled(user_id):
                         return False
 
                     if response.status == 200:
-                        output_file = f"output_{user_id}_{int(time.time())}.mp4"
-                        queue_item["output_file"] = output_file
+                        # ── Stage 2: AI running — live ticker ─────────────
+                        elapsed = format_elapsed(time.time() - start_time)
+                        await edit_stage(bot, user_id, msg_id, stage_idx=2, elapsed=elapsed)
+                        
+                        # Start our interactive loading animation
+                        ticker_task = asyncio.create_task(
+                            run_live_ticker(bot, user_id, msg_id, start_time)
+                        )
 
-                        with open(output_file, 'wb') as f:
-                            f.write(await response.read())
+                        video_bytes = await response.read()
+
+                        # Stop the animation once backend replies
+                        ticker_task.cancel()
+                        try:
+                            await ticker_task
+                        except asyncio.CancelledError:
+                            pass
+                        ticker_task = None
 
                         if self.queue.is_cancelled(user_id):
                             return False
 
-                        print(f"📤 Sending result to user {user_id}...")
+                        # ── Stage 3: Save encoded file ────────────────────
+                        elapsed = format_elapsed(time.time() - start_time)
+                        await edit_stage(bot, user_id, msg_id, stage_idx=3, elapsed=elapsed)
+
+                        ts          = int(time.time())
+                        output_file = f"masif_{user_id}_{ts}.mp4"
+                        queue_item["output_file"] = output_file
+                        with open(output_file, 'wb') as f:
+                            f.write(video_bytes)
+
+                        # ── Stage 4: Upload ───────────────────────────────
+                        elapsed = format_elapsed(time.time() - start_time)
+                        await edit_stage(bot, user_id, msg_id, stage_idx=4, elapsed=elapsed)
+
                         with open(output_file, 'rb') as v:
-                            await bot.send_video(chat_id=user_id, video=v)
+                            # FIX 2: Massive 300-second timeouts for sending final video to user
+                            await bot.send_video(
+                                chat_id=user_id,
+                                video=v,
+                                caption=f"✨ *Your MASIF result* — generated in {elapsed}!",
+                                parse_mode='Markdown',
+                                read_timeout=300,
+                                write_timeout=300,
+                                connect_timeout=60
+                            )
 
                         video_sent = True
-
-                        if os.path.exists(output_file):
-                            os.remove(output_file)
-                            print(f"🗑️ Output deleted: {output_file}")
+                        os.remove(output_file)
                         queue_item["output_file"] = None
 
+                        try:
+                            await bot.delete_message(chat_id=user_id, message_id=msg_id)
+                        except Exception:
+                            pass
+
+                        await bot.send_message(
+                            user_id,
+                            f"✅ *Success!* Temporary files have been securely deleted.",
+                            parse_mode='Markdown'
+                        )
                         return True
+
                     else:
                         err = await response.text()
-                        print(f"❌ Colab error {response.status}: {err[:200]}")
+                        print(f"❌ Backend error {response.status}: {err[:200]}")
+                        try:
+                            await bot.delete_message(chat_id=user_id, message_id=msg_id)
+                        except Exception:
+                            pass
                         return False
 
         except asyncio.TimeoutError:
             if video_sent:
-                print("⚠️ Timeout after send — video was already delivered successfully")
                 return True
-            print("❌ Colab timed out")
+            try:
+                await bot.delete_message(chat_id=user_id, message_id=msg_id)
+            except Exception:
+                pass
             await bot.send_message(user_id,
-                "⏰ *Timed out.* Your video took too long. Try a shorter clip.",
+                "⏰ *Processing timed out.* The video was too large or complex for the server to finish in time.",
                 parse_mode='Markdown'
             )
             return False
 
         except aiohttp.ClientConnectorError:
-            print("❌ Cannot connect to Colab")
+            try:
+                await bot.delete_message(chat_id=user_id, message_id=msg_id)
+            except Exception:
+                pass
             await bot.send_message(user_id,
-                "🔌 *Backend offline.* Colab is not running. Notify the admin.",
+                "🔌 *Backend offline.* The Colab/Kaggle server is not currently running.",
                 parse_mode='Markdown'
             )
             return False
 
+        except aiohttp.ServerDisconnectedError:
+            if video_sent:
+                return True
+            return False
+
         except Exception as e:
             print(f"❌ send_to_colab error: {e}")
+            if video_sent:
+                return True
+            try:
+                await bot.delete_message(chat_id=user_id, message_id=msg_id)
+            except Exception:
+                pass
             return False
 
         finally:
+            if ticker_task and not ticker_task.done():
+                ticker_task.cancel()
+            input_file = queue_item.get("input_file")
             if input_file and os.path.exists(input_file):
                 os.remove(input_file)
-                print(f"🗑️ Input deleted: {input_file}")
             queue_item["input_file"] = None
 
     async def back_to_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
-        await query.answer()
+        await safe_answer(query)
         await self.start(update, context)
 
     async def cancel_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -523,16 +724,16 @@ class SlowMoBot:
 
     async def setup_commands(self, application: Application):
         await application.bot.set_my_commands([
-            BotCommand("start", "Open main menu"),
-            BotCommand("queue", "Check your queue position"),
+            BotCommand("start",  "Open main menu"),
+            BotCommand("queue",  "Check your queue position"),
             BotCommand("cancel", "Cancel & delete your request"),
         ])
 
     def run(self):
         app = Application.builder().token(self.token).post_init(self.setup_commands).build()
 
-        app.add_handler(CommandHandler("start", self.start))
-        app.add_handler(CommandHandler("queue", self.queue_command))
+        app.add_handler(CommandHandler("start",  self.start))
+        app.add_handler(CommandHandler("queue",  self.queue_command))
         app.add_handler(CommandHandler("cancel", self.cancel_command))
 
         app.add_handler(CallbackQueryHandler(self.how_it_works,        pattern="^how_it_works$"))
@@ -547,7 +748,7 @@ class SlowMoBot:
 
         app.add_handler(MessageHandler(filters.VIDEO, self.handle_video))
 
-        print("🤖 Bot running. Colab backend must also be active for processing.")
+        print("🤖 Bot running. Colab/Kaggle backend must also be active for processing.")
         app.run_polling()
 
 
