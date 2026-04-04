@@ -50,6 +50,34 @@ async def safe_answer(query):
 # ──────────────────────────────────────────────
 
 SPINNER = ["🌑", "🌒", "🌓", "🌔", "🌕", "🌖", "🌗", "🌘"]
+
+# Waveform that scrolls left — renders nicely in monospace
+WAVE_FRAMES = [
+    "▁▂▄▆█▆▄▂▁▂▄▆█",
+    "▂▄▆█▆▄▂▁▂▄▆█▆",
+    "▄▆█▆▄▂▁▂▄▆█▆▄",
+    "▆█▆▄▂▁▂▄▆█▆▄▂",
+    "█▆▄▂▁▂▄▆█▆▄▂▁",
+    "▆▄▂▁▂▄▆█▆▄▂▁▂",
+    "▄▂▁▂▄▆█▆▄▂▁▂▄",
+    "▂▁▂▄▆█▆▄▂▁▂▄▆",
+]
+
+# GPU load bar that fluctuates realistically
+GPU_BARS = [
+    "████████░░  82%",
+    "█████████░  91%",
+    "██████████  99%",
+    "█████████░  94%",
+    "████████░░  87%",
+    "██████░░░░  63%",
+    "███████░░░  74%",
+    "█████████░  96%",
+    "████████░░  80%",
+    "██████████  100%",
+]
+
+# Kept for non-AI stages (simple left-right sweep)
 PULSE_BAR = ["[=    ]", "[ =   ]", "[  =  ]", "[   = ]", "[    =]", "[    =]", "[   = ]", "[  =  ]", "[ =   ]", "[=    ]"]
 
 PIPELINE_STAGES = [
@@ -87,23 +115,38 @@ def format_elapsed(seconds: float) -> str:
 
 def _make_text(spin_char: str, stage_num: int, emoji: str,
                label: str, elapsed: str, sub: str = "", pulse_idx: int = 0) -> str:
-    
-    # If we are in the AI stage, show an indeterminate pulse bar, otherwise standard progress
-    if stage_num == 3:
-        bar = PULSE_BAR[pulse_idx % len(PULSE_BAR)]
-        pct_text = "AI Working"
-    else:
-        bar  = build_bar(stage_num)
-        pct_text = f"{int(stage_num / len(PIPELINE_STAGES) * 100)}%"
 
-    text = (
-        f"{spin_char}  *MASIF is processing your video*\n\n"
-        f"`{bar}` {pct_text}\n\n"
-        f"{emoji}  *Current Stage: {label}*"
-    )
-    if sub:
-        text += f"\n_{sub}_"
-    text += f"\n\n⏱  *Time elapsed:* {elapsed}"
+    if stage_num == 3:
+        # ── Dynamic AI stage ──────────────────────────────────────────────
+        wave      = WAVE_FRAMES[pulse_idx % len(WAVE_FRAMES)]
+        gpu_bar   = GPU_BARS[pulse_idx % len(GPU_BARS)]
+        # Fake frame counter — ramps up naturally, caps at 999
+        frames    = min(pulse_idx * 17 + (pulse_idx % 6) * 4, 999)
+
+        text = (
+            f"{spin_char}  *MASIF — AI Processing*\n\n"
+            f"`{wave}`\n\n"
+            f"🖥️  GPU    `{gpu_bar}`\n"
+            f"🎞️  Frames  `{frames:04d}` interpolated\n\n"
+            f"{emoji}  *{label}*"
+        )
+        if sub:
+            text += f"\n_{sub}_"
+        text += f"\n\n⏱  *Time elapsed:* `{elapsed}`"
+
+    else:
+        # ── Standard stage ────────────────────────────────────────────────
+        bar     = build_bar(stage_num)
+        pct     = int(stage_num / len(PIPELINE_STAGES) * 100)
+        text = (
+            f"{spin_char}  *MASIF is processing your video*\n\n"
+            f"`{bar}` {pct}%\n\n"
+            f"{emoji}  *Current Stage: {label}*"
+        )
+        if sub:
+            text += f"\n_{sub}_"
+        text += f"\n\n⏱  *Time elapsed:* {elapsed}"
+
     return text
 
 # Includes the Cancel button directly on the loading screen
