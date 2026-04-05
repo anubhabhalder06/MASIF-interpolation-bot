@@ -347,7 +347,8 @@ def run_pipeline(input_path: str, speed: float = 0.5,
       4. Interleaver  -> merge original + new frames in order
       5. FFmpeg       -> stitch back into .mp4
     """
-    work_dir   = f"masif_work_{os.getpid()}"
+    import uuid
+    work_dir = f"masif_work_{uuid.uuid4().hex}"
     frames_dir = os.path.join(work_dir, "frames")
     interp_dir = os.path.join(work_dir, "interpolated")
     final_dir  = os.path.join(work_dir, "final")
@@ -463,7 +464,7 @@ def start_backend():
         print(f"Endpoint : {url}/process")
         print("Paste this URL into your bot .env as COLAB_BACKEND_URL")
         print("=" * 60 + "\n")
-        app.run(port=port, debug=False, use_reloader=False)
+        app.run(port=port, debug=False, use_reloader=False, threaded=False)
     except Exception as e:
         print(f"ngrok error: {e}")
 
