@@ -768,11 +768,38 @@ class SlowMoBot:
             if input_file and os.path.exists(input_file):
                 os.remove(input_file)
             queue_item["input_file"] = None
+            
+    # ── WELCOME MESSAGE HANDLER 
+    async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        name    = update.effective_user.first_name
+
+        welcome_text = (
+            f"👋 *Hey {name}, welcome to MASIF!*\n\n"
+            f"_AI-powered slow-motion & video smoother_\n\n"
+            f"📌 *Commands*\n"
+            f"/start — Main menu\n"
+            f"/queue — Your queue position\n"
+            f"/cancel — Cancel your request"
+        )
+
+        try:
+            with open("welcome_gif.gif", "rb") as gif:
+                await context.bot.send_animation(
+                    chat_id=user_id,
+                    animation=gif,
+                    caption=welcome_text,
+                    parse_mode="Markdown"
+                )
+        except FileNotFoundError:
+            await update.message.reply_text(welcome_text, parse_mode="Markdown")
+
 
     async def back_to_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         await safe_answer(query)
         await self.start(update, context)
+        
 
     async def cancel_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await self.cancel_request(update, context)
@@ -805,6 +832,7 @@ class SlowMoBot:
         app.add_handler(CallbackQueryHandler(self.add_to_queue,        pattern="^jitter_"))
 
         app.add_handler(MessageHandler(filters.VIDEO, self.handle_video))
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text))
 
         print("🤖 Bot running. Colab/Kaggle backend must also be active for processing.")
         app.run_polling()
